@@ -46,7 +46,7 @@ SETUP
    # repo is reported from Snyk's point of view only.
    export GITHUB_TOKEN=ghp_xxxx
    export GITHUB_ORG=my-org,my-other-org         # comma-separated
-   export GITHUB_API_BASE=https://api.github.com # for GHE
+   export GITHUB_API=https://api.github.com # for GHE
 
    # Optional -- one extra GitHub call per repo, so it is off by default.
    # Needs admin rights on the repo; without them the result is "unknown",
@@ -68,7 +68,7 @@ API_BASE = os.environ.get("SNYK_API_BASE", "https://api.snyk.io").rstrip("/")
 API_VERSION = "2024-10-15"
 SAST_TYPE = "sast"  # the only value meaning "Snyk Code project"; every other type (maven, npm, gradle, pip, yarn, nuget, dockerfile, ...) is Open Source / container / IaC
 
-GITHUB_API_BASE = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
+GITHUB_API = os.environ.get("GITHUB_API", "https://api.github.com").rstrip("/")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_ORGS = [o.strip() for o in os.environ.get("GITHUB_ORG", "").split(",") if o.strip()]
 CHECK_WEBHOOKS = os.environ.get("CHECK_WEBHOOKS", "").lower() in ("1", "true", "yes")
@@ -173,8 +173,33 @@ def gh_paginate(url, params=None):
         params = None
 
 
+class GitHubOwnerError(Exception):
+    """A GitHub owner could not be listed, with an actionable reason."""
+
+
+def resolve_owner_repos_url(owner):
+    """Return the correct repos URL for `owner`, org or user.
+
+    GitHub 404s /orgs/{name} for three different reasons -- wrong name, it is
+    a user account rather than an org, and 'your token cannot see it' -- so
+    probe to tell them apart instead of surfacing a bare 404.
+    """
+    if gh_get(f"{GITHUB_API}/orgs/{owner}").status_code != 404:
+        return f"{GITHUB_API}/orgs/{owner}/repos"
+
+    user = gh_get(f"{GITHUB_API}/users/{owner}")
+    if user.ok and user.json().get("type") == "User":
+        return f"{GITHUB_API}/users/{owner}/repos"
+    if user.status_code == 404:
+        raise GitHubOwnerError(
+            f"'{owner}' does not exist on GitHub, or your token cannot see it. "
+            "Check for a typo; if it is a private org, confirm the token is "
+            "SSO-authorized for it.")
+    raise GitHubOwnerError(f"'{owner}' lookup failed: HTTP {user.status_code}")
+
+
 def list_github_repos(org):
-    return list(gh_paginate(f"{GITHUB_API_BASE}/orgs/{org}/repos",
+    return list(gh_paginate(resolve_owner_repos_url(org),
                             {"per_page": 100, "type": "all"}))
 
 
@@ -184,7 +209,7 @@ def has_snyk_webhook(full_name):
     Returns 'unknown' rather than 'no' when we lack admin rights, so a
     permissions gap is never reported as a missing webhook.
     """
-    resp = gh_get(f"{GITHUB_API_BASE}/repos/{full_name}/hooks", {"per_page": 100})
+    resp = gh_get(f"{GITHUB_API}/repos/{full_name}/hooks", {"per_page": 100})
     if resp.status_code in (403, 404):
         return "unknown"
     if not resp.ok:
@@ -213,11 +238,27 @@ def main():
     # --- collect GitHub repos -------------------------------------------------
     gh_repos = {}  # normalised full_name -> repo object
     if use_github:
+        failed_orgs = []
         for org in GITHUB_ORGS:
-            repos = list_github_repos(org)
+            # One unreachable owner must not discard the repos already
+            # collected from the others -- report it and carry on.
+            try:
+                repos = list_github_repos(org)
+            except (GitHubOwnerError, requests.HTTPError) as e:
+                print(f"GitHub {org}: SKIPPED -- {e}", file=sys.stderr)
+                failed_orgs.append(org)
+                continue
             print(f"GitHub {org}: {len(repos)} repos", file=sys.stderr)
             for r in repos:
                 gh_repos[norm(r.get("full_name"))] = r
+
+        if failed_orgs:
+            print(f"WARNING: {len(failed_orgs)} owner(s) could not be listed "
+                  f"({', '.join(failed_orgs)}). Repos under them are missing from "
+                  "this report, so 'Snyk only' will be overstated.", file=sys.stderr)
+        if not gh_repos:
+            print("No GitHub repos retrieved -- disabling the GitHub side.", file=sys.stderr)
+            use_github = False
     else:
         print("GitHub side disabled (set GITHUB_TOKEN and GITHUB_ORG to enable). "
               "'Not imported' and webhook columns will be blank.", file=sys.stderr)
