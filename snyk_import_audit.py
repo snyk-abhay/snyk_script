@@ -286,12 +286,26 @@ def main():
     matched_gh = set()
     webhook_counts = {}
 
+    failed_snyk_orgs = []
     for org in orgs:
         org_id = org["id"]
         org_name = attr(org.get("attributes", {}), "name", "slug", default=org_id)
 
-        targets = {t["id"]: t for t in list_targets(org_id)}
-        projects = list_projects(org_id)
+        # A token can enumerate a group's orgs without being able to read
+        # inside every one of them, and Snyk answers 404 (not 403) for an org
+        # it will not show you. Skip it rather than losing the whole run.
+        try:
+            targets = {t["id"]: t for t in list_targets(org_id)}
+            projects = list_projects(org_id)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            hint = (" -- the token cannot read this org; add the service account "
+                    "to it, or grant a group-level role that includes org read"
+                    if code in (403, 404) else "")
+            print(f"  {org_name} ({org_id}): SKIPPED HTTP {code}{hint}", file=sys.stderr)
+            failed_snyk_orgs.append(org_name)
+            continue
+
         print(f"  {org_name}: {len(targets)} targets, {len(projects)} projects", file=sys.stderr)
 
         by_target = {}
@@ -383,6 +397,13 @@ def main():
     # --- summary --------------------------------------------------------------
     out = sys.stderr
     print(f"\nDone. {total_targets} Snyk target(s) scanned.", file=out)
+
+    if failed_snyk_orgs:
+        print(f"\n  WARNING: {len(failed_snyk_orgs)} Snyk org(s) could not be read "
+              f"({', '.join(failed_snyk_orgs)}).\n"
+              "  Repos imported into them look un-imported here, so 'GitHub only' "
+              "is OVERSTATED\n  and 'Tested' is understated. Fix the token's org "
+              "access before trusting these numbers.", file=out)
 
     if use_github:
         print("\n  Source          Meaning                        Repo count", file=out)
