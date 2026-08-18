@@ -71,6 +71,11 @@ Optional environment:
   IMPORT_POLL_INTERVAL  5 (default). Seconds between job status polls.
   EXCLUDE_REPOS         Comma-separated globs, e.g. my-org/sandbox-*,my-org/tmp-*
   INCLUDE_ARCHIVED      1 to also act on archived repos (skipped by default).
+  WEBHOOK_CONCURRENCY   10 (default). Parallel GitHub calls in the webhook
+                        pass. That pass is pure network wait, so it scales
+                        near-linearly: 1200 repos take ~8min at 1, ~50s at 10,
+                        ~25s at 20. Above ~20 risks GitHub secondary rate
+                        limits for little further gain.
   LIST_LIMIT            25 (default). Repo names printed per bucket before
                         truncating with "... and N more".
   ONBOARD_CSV           onboard-report.csv (default). FILENAME only, not a path.
@@ -150,6 +155,7 @@ every deletion is logged as it happens.
 """
 
 import argparse
+import concurrent.futures
 import csv
 import fnmatch
 import json
@@ -178,6 +184,11 @@ ATTENTION_THRESHOLD = 5
 
 # How many repo names to print per bucket before truncating.
 LIST_LIMIT = int(os.environ.get("LIST_LIMIT", "25"))
+
+# The webhook pass is one GitHub call per repo and is pure I/O wait, so it
+# parallelises almost linearly. 10 keeps well clear of GitHub's secondary rate
+# limits while turning ~8 minutes of serial calls into under a minute.
+WEBHOOK_CONCURRENCY = max(1, int(os.environ.get("WEBHOOK_CONCURRENCY", "10")))
 
 # Deleting targets is destructive, so its cap is deliberately much lower than
 # MAX_ACTIONS_PER_RUN -- a misfire should cost a handful of repos, not fifty.
@@ -880,6 +891,31 @@ def build_inventory_from_repos(repo_rows, default_org):
     return inventory
 
 
+def check_webhooks(repos):
+    """webhook_state for many repos at once. Returns {full_name: state}.
+
+    Threads rather than async because the work is entirely network wait and
+    requests is blocking. Progress is printed from the main thread as futures
+    complete, so no locking is needed around output.
+    """
+    results = {}
+    if not repos:
+        return results
+    workers = min(WEBHOOK_CONCURRENCY, len(repos))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(webhook_state, r): r for r in repos}
+        for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            repo = futures[fut]
+            try:
+                results[repo] = fut.result()
+            except Exception:
+                # One repo failing must not abort the sweep; "unknown" is the
+                # safe verdict since it never triggers a re-import.
+                results[repo] = "unknown"
+            progress(done, len(repos), repo)
+    return results
+
+
 def find_work(inventory):
     """Return [(full_name, info, [reasons])] for repos needing repair."""
     work, skipped = [], {}
@@ -890,9 +926,15 @@ def find_work(inventory):
                    if i.get("imported") and "/" in i["full_name"]
                    and not excluded(i["full_name"])
                    and not (i.get("archived") and not INCLUDE_ARCHIVED))
+    hooks = {}
     if CHECK_WEBHOOKS and to_check:
         head("GitHub webhooks")
-        item("Scanning", f"{to_check} repo(s) via {GITHUB_API_BASE.split('//')[-1]}")
+        item("Scanning", f"{to_check} repo(s) via {GITHUB_API_BASE.split('//')[-1]} "
+                         f"{dim(f'({WEBHOOK_CONCURRENCY} at a time)')}")
+        hooks = check_webhooks([i["full_name"] for i in inventory.values()
+                                if i.get("imported") and "/" in i["full_name"]
+                                and not excluded(i["full_name"])
+                                and not (i.get("archived") and not INCLUDE_ARCHIVED)])
 
     for key, info in sorted(inventory.items()):
         full = info["full_name"]
@@ -916,10 +958,9 @@ def find_work(inventory):
         # A never-imported repo has no webhook by definition -- the import
         # creates it -- so skip the costly hook lookup for those.
         if CHECK_WEBHOOKS and info.get("imported"):
-            state = webhook_state(full)
+            state = hooks.get(full, "unknown")
             info["webhook"] = state
             checked += 1
-            progress(checked, to_check, full)
             if state == "missing":
                 reasons.append("missing webhook")
             # 'unknown' is already reported in the webhook tally below; do not
