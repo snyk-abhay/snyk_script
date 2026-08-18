@@ -259,6 +259,29 @@ def item(label, value, style=None):
     print(f"   {label:<16} {styled}", file=sys.stderr, flush=True)
 
 
+def progress(done, total, label=""):
+    """In-place progress on a terminal, periodic lines otherwise.
+
+    The webhook pass is one GitHub call per repo, so on a large estate it is
+    minutes of silence without this. Cron logs get a line every 25 instead of
+    thousands of carriage returns.
+    """
+    if _COLOR:
+        bar_w = 24
+        filled = int(bar_w * done / total) if total else bar_w
+        bar = "#" * filled + dim("." * (bar_w - filled))
+        print(f"\r   {'':<16} [{bar}] {done}/{total}  {label[:34]:<34}",
+              end="", file=sys.stderr, flush=True)
+    elif done == total or done % 25 == 0:
+        print(f"   checked {done}/{total}", file=sys.stderr, flush=True)
+
+
+def progress_done():
+    """Clear the in-place progress line so the next output starts clean."""
+    if _COLOR:
+        print("\r" + " " * 100 + "\r", end="", file=sys.stderr, flush=True)
+
+
 def log_ok(msg):   log(f"{green('✓')} {msg}")
 def log_warn(msg): log(f"{yellow('!')} {yellow(msg)}")
 def log_fail(msg): log(f"{red('✗')} {msg}")
@@ -862,6 +885,15 @@ def find_work(inventory):
     work, skipped = [], {}
     checked = 0
 
+    # Known up front so the progress line has a denominator.
+    to_check = sum(1 for i in inventory.values()
+                   if i.get("imported") and "/" in i["full_name"]
+                   and not excluded(i["full_name"])
+                   and not (i.get("archived") and not INCLUDE_ARCHIVED))
+    if CHECK_WEBHOOKS and to_check:
+        head("GitHub webhooks")
+        item("Scanning", f"{to_check} repo(s) via {GITHUB_API_BASE.split('//')[-1]}")
+
     for key, info in sorted(inventory.items()):
         full = info["full_name"]
         if excluded(full):
@@ -887,6 +919,7 @@ def find_work(inventory):
             state = webhook_state(full)
             info["webhook"] = state
             checked += 1
+            progress(checked, to_check, full)
             if state == "missing":
                 reasons.append("missing webhook")
             # 'unknown' is already reported in the webhook tally below; do not
@@ -900,13 +933,12 @@ def find_work(inventory):
             work.append((full, info, reasons))
 
     if CHECK_WEBHOOKS:
+        progress_done()
         tally = {}
         for i in inventory.values():
             if i.get("imported"):
                 tally[i.get("webhook", "not checked")] = \
                     tally.get(i.get("webhook", "not checked"), 0) + 1
-        head("GitHub webhooks")
-        item("Scanned", f"{checked} repo(s) via {GITHUB_API_BASE.split('//')[-1]}")
         item("Present", tally.get("present", 0), green)
         item("Missing", tally.get("missing", 0), yellow if tally.get("missing") else green)
         if tally.get("unknown"):
