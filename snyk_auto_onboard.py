@@ -528,6 +528,10 @@ def gh_headers():
     }
 
 
+class RateLimited(Exception):
+    """GitHub rate limiting outlasted our retries for this call."""
+
+
 def gh_get(url, params=None):
     for _ in range(5):
         resp = requests.get(url, headers=gh_headers(), params=params, timeout=30)
@@ -537,7 +541,9 @@ def gh_get(url, params=None):
             time.sleep(min(wait, 300))
             continue
         return resp
-    raise RuntimeError(f"Repeated rate limiting calling {url}")
+    # Distinct from a generic failure: the answer is "we never found out",
+    # not "there is no webhook". Callers must not treat it as either.
+    raise RateLimited(url)
 
 
 def webhook_state(full_name):
@@ -908,6 +914,10 @@ def check_webhooks(repos):
             repo = futures[fut]
             try:
                 results[repo] = fut.result()
+            except RateLimited:
+                # Not the same as "no admin rights" -- we simply never got an
+                # answer, and it will be retried on the next run.
+                results[repo] = "rate-limited"
             except Exception:
                 # One repo failing must not abort the sweep; "unknown" is the
                 # safe verdict since it never triggers a re-import.
@@ -985,6 +995,10 @@ def find_work(inventory):
         if tally.get("unknown"):
             item("Unknown", tally["unknown"], yellow)
             item("", dim("no admin rights on those repos - cannot tell"))
+        if tally.get("rate-limited"):
+            item("Not checked", tally["rate-limited"], red)
+            item("", dim("GitHub rate limit outlasted retries - NOT verified, "
+                         "will be re-checked next run"))
     for reason, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
         item("Skipped", f"{count} {dim('- ' + reason)}", yellow)
     return work
@@ -1275,6 +1289,9 @@ def run_once(apply_changes, scope=None):
     ok_count = fail_count = 0
     acted = []
     needs_manual = []
+    # Flipped once an import call has demonstrably worked in this run. Until
+    # then, nothing is deleted.
+    import_proven = False
 
     # A missing webhook can only be restored by deleting the target and
     # importing fresh -- a plain re-import returns 409 and changes nothing.
@@ -1289,6 +1306,22 @@ def run_once(apply_changes, scope=None):
             log(f"[{i}/{len(chosen)}] SKIP     {full} -- no GitHub integration on "
                 f"org {info['org_name']}")
             continue
+
+        if norm(full) in recreate_keys and not import_proven:
+            # Deleting before we know imports work is how a run destroys targets
+            # it cannot restore. Re-import in place first: it returns 409 and
+            # fixes nothing, but it proves the credentials work before anything
+            # destructive happens.
+            probe_ok, probe_detail, _ = import_target(
+                info["org_id"], integration_id, *full.partition("/")[::2],
+                info.get("branch"))
+            if not probe_ok:
+                log_fail(f"[{i}/{len(chosen)}] {full} {dim('-')} {probe_detail}")
+                log_fail("ABORTING RUN before deleting anything: imports are not "
+                         "working, so a delete could not be undone.")
+                write_csv(inventory, CSV_FILE)
+                return 2
+            import_proven = True
 
         if norm(full) in recreate_keys:
             gone, why = delete_target(info["org_id"], info["target_id"])
@@ -1333,6 +1366,19 @@ def run_once(apply_changes, scope=None):
             fail_count += 1
             rec["last_result"] = detail
             log_fail(f"[{i}/{len(chosen)}] {full} {dim('-')} {detail}")
+            # An auth failure is not per-repo -- it will fail for every repo.
+            # Continuing would delete target after target and recreate none of
+            # them, so stop the run dead.
+            if "401" in detail or "403" in detail:
+                save_state(state)
+                log_fail("ABORTING RUN: imports are failing with an auth error. "
+                         "Every further repo would be deleted and not restored.")
+                if recreate_keys:
+                    log_fail(f"{len([k for k in recreate_keys])} repo(s) in this batch "
+                             "were queued for delete-and-re-import; any already "
+                             "deleted must be re-imported once the token is fixed.")
+                write_csv(inventory, CSV_FILE)
+                return 2
 
         rec["pending_verify"] = True
         save_state(state)  # after each repo, so a crash does not lose progress
