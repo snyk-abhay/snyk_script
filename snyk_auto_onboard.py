@@ -298,6 +298,106 @@ def log_warn(msg): log(f"{yellow('!')} {yellow(msg)}")
 def log_fail(msg): log(f"{red('✗')} {msg}")
 
 
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
+# A run touches two different services, and a failure in one reads exactly like
+# a failure in the other unless the log says which. So every stage announces a
+# number, the service it calls, and why it has to; every failure quotes the same
+# number back. "Which step broke, who rejected us, and why" is then answerable
+# from the log alone, without reading this file.
+
+TOTAL_STEPS = 8
+_step_no = 0
+_step_title = "startup"
+
+
+def step(title):
+    """Numbered section header. Failures quote the number back (explain_fail).
+
+    Which service each step calls:
+      1 Snyk inventory      Snyk API    orgs, targets, projects, group assets
+      2 GitHub webhooks     GitHub API  GET /repos/{owner}/{repo}/hooks
+      3 Coverage            -           computation only
+      4 Verification        Snyk API    did last run's imports take effect
+      5 Snyk org            -           which org to act on
+      6 Action required     -           which bucket to act on
+      7 Import              Snyk API    POST /v1/org/../import (+GitHub branch)
+      8 Re-check            both        confirm from the source of truth
+    """
+    global _step_no, _step_title
+    _step_no += 1
+    _step_title = title
+    print(f"\n{bold(cyan(f'▸ STEP {_step_no}/{TOTAL_STEPS}  {title}'))}",
+          file=sys.stderr, flush=True)
+
+
+def current_step():
+    return f"STEP {_step_no}/{TOTAL_STEPS} ({_step_title})"
+
+
+def explain_fail(subject, service, endpoint, status, message, why, suggest):
+    """A failure that says which step, who rejected it, and what to do.
+
+    Deliberately verbose. A bare 'HTTP 401' sends people to re-issue tokens for
+    hours when the credentials at fault were never theirs.
+    """
+    log_fail(f"{current_step()}  {subject}")
+    item("rejected by", f"{service} {dim(endpoint)}  ->  {red('HTTP ' + str(status))}")
+    if message:
+        item("said", dim(str(message)[:180]))
+    item("why", yellow(why))
+    item("do this", suggest)
+
+
+def diagnose_import_error(status, body):
+    """(why, suggest) for a failed import. Returns plain English, not a code.
+
+    Each entry below was a real dead end at some point in this integration's
+    life; the mapping exists so the next person does not have to rediscover
+    which one applies to them.
+    """
+    if status == 401:
+        return (
+            "Snyk authenticated YOU fine, then could not authenticate ITSELF "
+            "to GitHub. The reply says 'Invalid credentials' without saying "
+            "whose -- and reads in this same run succeeded, so it is not yours.",
+            "Import this one repo from the Snyk UI. If the UI works, the token "
+            "cannot drive this integration type (service-account and SAML "
+            "tokens cannot use the user-OAuth 'github' integration; use a "
+            "personal API token, or a PAT-based 'github-enterprise' "
+            "integration). If the UI also fails, the integration's stored "
+            "GitHub credentials expired -- reconnect it in Settings > "
+            "Integrations.")
+    if status == 403:
+        return (
+            "Authenticated, but not allowed to import into this org.",
+            "Check the token's role on THIS org, not just the group.")
+    if status == 422:
+        return (
+            "Snyk rejected the DATA, not the credentials. This endpoint "
+            "requires owner, name AND branch, and does not fall back to the "
+            "repo default when branch is absent.",
+            "The branch was empty in Snyk's asset record "
+            "(default_branch_name) and could not be read from GitHub either. "
+            "An empty repository has no default branch anywhere and cannot be "
+            "imported -- add it to EXCLUDE_REPOS.")
+    if status == 404:
+        return (
+            "The org id or integration id does not exist, or this token cannot "
+            "see it. Snyk answers 404 rather than 403 for things it will not "
+            "show you.",
+            "Re-check the org id and re-read the integration id from "
+            "GET /v1/org/<org>/integrations.")
+    if status == 429:
+        return (
+            "Snyk rate limited the import, not an error in the request.",
+            "Lower MAX_ACTIONS_PER_RUN or raise IMPORT_DELAY. It retries next "
+            "run on its own.")
+    return ("Unrecognised import failure.",
+            "Read the raw response above; it is quoted verbatim.")
+
+
 def norm(name):
     return (name or "").strip().lower()
 
@@ -482,38 +582,33 @@ def get_github_integration_id(org_id):
     return None
 
 
+IMPORT_ENDPOINT = "POST /v1/org/{org}/integrations/{integration}/import"
+
+
 def import_target(org_id, integration_id, owner, name, branch):
-    """Re-import a repo. Returns (ok, detail, already_existed)."""
+    """Re-import a repo. Returns (ok, detail, already_existed, status).
+
+    The status is returned rather than embedded in `detail` because the caller
+    both diagnoses it (see diagnose_import_error) and decides on it -- an auth
+    failure must stop the whole run, a 422 must not.
+    """
     url = f"{API_BASE}/v1/org/{org_id}/integrations/{integration_id}/import"
     target = {"owner": owner, "name": name}
     if branch:
-        target["branch"] = branch          # omitted -> Snyk uses the repo default
+        # Required, not optional: without it Snyk answers 422 "Expecting owner,
+        # name, branch". It does not fall back to the repo default.
+        target["branch"] = branch
     payload = {"target": target}
     resp = requests.post(url, headers=snyk_headers(), json=payload, timeout=30)
 
-    if resp.status_code in (200, 201):
-        return True, resp.headers.get("Location", "queued"), False
-    if resp.status_code == 409:
+    st = resp.status_code
+    if st in (200, 201):
+        return True, resp.headers.get("Location", "queued"), False, st
+    if st == 409:
         # The target already exists. For an empty target this is still useful
         # (Snyk re-scans it), but it does NOT recreate a deleted webhook.
-        return True, "target already exists (re-scan requested)", True
-    if resp.status_code == 429:
-        return False, "rate limited (retried next run)", False
-    if resp.status_code in (401, 403):
-        # Reads succeeding while imports 401 is a specific, common situation:
-        # the token authenticates fine but either it lacks write permission,
-        # or Snyk's own stored GitHub credentials have gone stale. The message
-        # says "Invalid credentials" without saying WHOSE.
-        return False, (
-            f"HTTP {resp.status_code} {resp.text[:120]}\n"
-            "          Reads work but imports do not. Two possible causes:\n"
-            "          1) The token's role lacks import/write on this org "
-            "(try a personal API token to compare).\n"
-            "          2) Snyk's stored GitHub integration credentials are "
-            "stale -- reconnect GitHub in Snyk Settings > Integrations.\n"
-            "          Fastest check: import this repo from the Snyk UI. If the "
-            "UI also fails, it is (2)."), False
-    return False, f"HTTP {resp.status_code}: {resp.text[:200]}", False
+        return True, "target already exists (re-scan requested)", True, st
+    return False, resp.text[:200], False, st
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +632,10 @@ def gh_get(url, params=None):
         resp = requests.get(url, headers=gh_headers(), params=params, timeout=30)
         if resp.status_code in (403, 429) and resp.headers.get("X-RateLimit-Remaining") == "0":
             wait = max(int(resp.headers.get("X-RateLimit-Reset", 0)) - int(time.time()), 1)
-            log(f"GitHub rate limited, sleeping {min(wait, 300)}s")
+            # Attributed, because a GitHub throttle in step 2 looks nothing
+            # like a Snyk rejection in step 6 and must not be confused for one.
+            log(f"{current_step()}  GitHub API rate limited, sleeping "
+                f"{min(wait, 300)}s")
             time.sleep(min(wait, 300))
             continue
         return resp
@@ -620,7 +718,7 @@ def build_inventory(quiet=False):
 
     gid = os.environ["SNYK_GROUP_ID"]
     if not quiet:
-        head("Snyk")
+        step("Snyk inventory")
         item("Group", f"{group_name(gid)}  {dim(gid)}")
     orgs = list_orgs_in_group(gid)
 
@@ -668,7 +766,7 @@ def build_inventory(quiet=False):
         for nm in {v["orig_name"] for v in by_repo.values()}:
             state = by_repo.get(norm(nm), {})
             ptypes = state.get("types") or set()
-            inventory[norm(nm)] = {
+            entry = {
                 "full_name": state.get("orig_name") or nm,
                 "org_id": org_id,
                 "org_name": org_name,
@@ -678,7 +776,28 @@ def build_inventory(quiet=False):
                 "has_sast": "sast" in ptypes,
                 "has_sca": any(t and t != "sast" for t in ptypes),
                 "types": sorted(t for t in ptypes if t),
+                "also_in": [],
             }
+            key = norm(nm)
+            prev = inventory.get(key)
+            if prev is None:
+                inventory[key] = entry
+            else:
+                # Same repo is a target in more than one Snyk Org. Snyk permits
+                # this (one GitHub org -> many Snyk Orgs). Assigning blindly let
+                # the last org iterated overwrite the first, so a repo with 40
+                # projects in org A and an empty target in org B was reported
+                # UNSCANNED whenever B came second -- and then queued for
+                # delete-and-reimport. Keep the org where it is actually
+                # scanned; remember the others so the report can say so.
+                win, lose = ((prev, entry)
+                             if prev["project_count"] >= entry["project_count"]
+                             else (entry, prev))
+                win["also_in"] = (win.get("also_in") or []) + (lose.get("also_in") or []) + [{
+                    "org_id": lose["org_id"], "org_name": lose["org_name"],
+                    "target_id": lose["target_id"],
+                    "project_count": lose["project_count"]}]
+                inventory[key] = win
 
         if not quiet:
             item("Org", f"{org_name}  {dim(org_id)}")
@@ -732,8 +851,20 @@ def build_inventory(quiet=False):
             "types": [],
             "branch": a.get("default_branch_name"),
             "archived": bool(a.get("archived")),
+            "also_in": [],
         }
         discovered += 1
+
+    dupes = {k: v for k, v in inventory.items() if v.get("also_in")}
+    if dupes and not quiet:
+        log_warn(f"{len(dupes)} repo(s) exist as targets in more than one Snyk Org. "
+                 "Counting the org where each is actually scanned:")
+        for k, v in list(dupes.items())[:LIST_LIMIT]:
+            others = ", ".join(f"{o['org_name']} ({o['project_count']} proj)"
+                               for o in v["also_in"])
+            print(f"        {dim('-')} {v['full_name']}: using "
+                  f"{v['org_name']} ({v['project_count']} proj); also in {others}",
+                  file=sys.stderr)
 
     empty = sum(1 for v in inventory.values()
                 if v.get("imported") and v["project_count"] == 0)
@@ -841,7 +972,7 @@ def build_inventory_from_repos(repo_rows, default_org):
         sys.exit("--repos needs a Snyk org: add an 'org_id' column, or pass --org "
                  "<org_id> (or set SNYK_IMPORT_ORG_ID).")
 
-    head("Inventory")
+    step("Inventory from file")
     item("Source", f"{len(repo_rows)} repo(s) from file")
 
     state_by_repo, org_names = {}, {}
@@ -938,7 +1069,7 @@ def find_work(inventory):
                    and not (i.get("archived") and not INCLUDE_ARCHIVED))
     hooks = {}
     if CHECK_WEBHOOKS and to_check:
-        head("GitHub webhooks")
+        step("GitHub webhooks")
         item("Scanning", f"{to_check} repo(s) via {GITHUB_API_BASE.split('//')[-1]} "
                          f"{dim(f'({WEBHOOK_CONCURRENCY} at a time)')}")
         hooks = check_webhooks([i["full_name"] for i in inventory.values()
@@ -1078,7 +1209,7 @@ def verify_previous_run(state, inventory):
             rec["attempts"] = 0
         else:
             still_broken += 1
-    head("Verification of previous run")
+    step("Verification of previous run")
     item("Acted on", f"{len(pending)} repo(s)")
     item("Now scanned", fixed_scan, green if fixed_scan else None)
     item("Webhook created", fixed_hook, green if fixed_hook else None)
@@ -1162,7 +1293,7 @@ def report_coverage(inventory):
         elif i.get("has_sast"):
             sast.append(i["full_name"])
 
-    head("Coverage")
+    step("Coverage")
     item("SCA + SAST", len(both), green)
     item("SCA only", f"{len(sca)} {dim('- no Snyk Code project')}",
          yellow if sca else None)
@@ -1189,6 +1320,61 @@ def classify_work(work):
     return buckets
 
 
+def group_by_org(items):
+    """[(full, info, reasons)] -> {(org_id, org_name): [...]}, biggest first."""
+    out = {}
+    for it in items:
+        out.setdefault((it[1]["org_id"], it[1]["org_name"]), []).append(it)
+    return dict(sorted(out.items(), key=lambda kv: -len(kv[1])))
+
+
+def org_summary(items):
+    """'N webhook · M unscanned' for one org's slice of the work."""
+    hooks = sum(1 for _, _, r in items if any("missing webhook" in x for x in r))
+    return f"{hooks} webhook {dim('·')} {len(items) - hooks} unscanned"
+
+
+def choose_org(work, preset):
+    """Which Snyk Org to act on. Returns a set of org ids.
+
+    Findings are grouped per org because the action is per org: the import
+    endpoint is /v1/org/{org}/integrations/{id}/import, so each org has its own
+    integration and its own credentials. One org's broken integration must not
+    be read as "imports are broken".
+    """
+    step("Snyk org")
+    groups = group_by_org(work)
+    for n, ((oid, oname), items) in enumerate(groups.items(), 1):
+        item(f"[{n}] {oname}", f"{len(items)} repo(s)  {dim(org_summary(items))}")
+        item("", dim(oid))
+    all_n = len(groups) + 1
+    item(f"[{all_n}] all orgs", f"{len(work)} repo(s)")
+
+    keys = list(groups.keys())
+    if preset:
+        want = norm(preset)
+        hit = {oid for oid, oname in keys if norm(oname) == want or oid == preset}
+        if not hit:
+            log_fail(f"--org {preset!r} matched none of: "
+                     + ", ".join(oname for _, oname in keys))
+            return set()
+        log(f"Org: {preset} (from --org)")
+        return hit
+    if not sys.stdin.isatty():
+        log("Org: all (non-interactive; use --org to narrow)")
+        return {oid for oid, _ in keys}
+    try:
+        ans = input(f"  Which org? [1-{all_n}, or n to cancel] "
+                    f"(default {all_n}): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return set()
+    if ans == "n":
+        return set()
+    if ans.isdigit() and 1 <= int(ans) <= len(keys):
+        return {keys[int(ans) - 1][0]}
+    return {oid for oid, _ in keys}
+
+
 def choose_scope(buckets, preset):
     """Decide which buckets to act on: flag, or prompt when interactive.
 
@@ -1196,7 +1382,7 @@ def choose_scope(buckets, preset):
     waiting for an answer nobody is there to give.
     """
     n_hook, n_scan = len(buckets["webhook"]), len(buckets["unscanned"])
-    head("Action required")
+    step("Action required")
 
     def listing(label, items, note):
         item(label, f"{len(items)} repo(s) {dim(note)}", yellow if items else None)
@@ -1213,6 +1399,15 @@ def choose_scope(buckets, preset):
     listing("[1] webhook", buckets["webhook"], "on Snyk, but no webhook")
     listing("[2] unscanned", buckets["unscanned"], "no target, or target with 0 projects")
     item("[3] both", f"{n_hook + n_scan} repo(s)")
+
+    # Per-org split of the same numbers. A single total hides the case where
+    # one org is entirely broken and the others are entirely fine.
+    both = buckets["webhook"] + buckets["unscanned"]
+    per_org = group_by_org(both)
+    if len(per_org) > 1:
+        item("by org", "")
+        for (oid, oname), items in per_org.items():
+            item(f"  {oname}", f"{len(items)} repo(s)  {dim(org_summary(items))}")
 
     if preset:
         log(f"Scope: {preset} (from --scope)")
@@ -1238,7 +1433,7 @@ def select_batch(buckets, scope):
     return buckets["webhook"] + buckets["unscanned"]
 
 
-def run_once(apply_changes, scope=None):
+def run_once(apply_changes, scope=None, org=None):
     """Stage 1 check -> report -> choose -> import one by one -> verify -> CSV.
 
     The CSV is written LAST, deliberately: written before the imports it would
@@ -1264,7 +1459,18 @@ def run_once(apply_changes, scope=None):
         save_state(state)
         return 0
 
-    # --- Stage 2: report the split and pick what to act on ---
+    # --- Stage 2: narrow to an org, then report the split and pick a bucket ---
+    orgs_wanted = choose_org(work, org)
+    if not orgs_wanted:
+        log("No org selected -- writing report only.")
+        write_csv(inventory, CSV_FILE)
+        return 0
+    work = [w for w in work if w[1]["org_id"] in orgs_wanted]
+    if not work:
+        log("Nothing to do in the selected org(s) -- writing report only.")
+        write_csv(inventory, CSV_FILE)
+        return 0
+
     buckets = classify_work(work)
     chosen = select_batch(buckets, choose_scope(buckets, scope))
 
@@ -1286,6 +1492,7 @@ def run_once(apply_changes, scope=None):
         return 0
 
     # --- Stage 3: import one by one, following each job to completion ---
+    step("Import")
     ok_count = fail_count = 0
     acted = []
     needs_manual = []
@@ -1307,16 +1514,45 @@ def run_once(apply_changes, scope=None):
                 f"org {info['org_name']}")
             continue
 
+        owner, _, name = full.partition("/")
+        # Resolved BEFORE the probe, because the probe sends a real import and
+        # the v1 endpoint rejects a payload without a branch (422 "Expecting
+        # owner, name, branch"). It does NOT fall back to the repo default.
+        # Snyk's asset record usually carries it; GitHub is the backstop.
+        branch = info.get("branch")
+        if not branch:
+            try:
+                branch = default_branch(full)
+            except RateLimited:
+                # GitHub never answered. Distinct from "the repo has no branch":
+                # this repo is unresolved, not unimportable, so defer it. Left
+                # uncaught this propagated out of the loop and killed the run.
+                log_warn(f"[{i}/{len(chosen)}] DEFER    {full} -- GitHub rate "
+                         "limited while reading the default branch; retried next run")
+                continue
+            except requests.RequestException as e:
+                log_warn(f"[{i}/{len(chosen)}] DEFER    {full} -- GitHub unreachable "
+                         f"while reading the default branch ({type(e).__name__})")
+                continue
+        if not branch:
+            # GitHub answered and the repo genuinely has no default branch --
+            # an empty repo with no commits. Nothing to import, ever.
+            log_warn(f"[{i}/{len(chosen)}] SKIP     {full} -- no default branch on "
+                     "GitHub (empty repo); the import API requires one")
+            continue
+
         if norm(full) in recreate_keys and not import_proven:
             # Deleting before we know imports work is how a run destroys targets
             # it cannot restore. Re-import in place first: it returns 409 and
             # fixes nothing, but it proves the credentials work before anything
             # destructive happens.
-            probe_ok, probe_detail, _ = import_target(
-                info["org_id"], integration_id, *full.partition("/")[::2],
-                info.get("branch"))
+            probe_ok, probe_detail, _, probe_st = import_target(
+                info["org_id"], integration_id, owner, name, branch)
             if not probe_ok:
-                log_fail(f"[{i}/{len(chosen)}] {full} {dim('-')} {probe_detail}")
+                why, suggest = diagnose_import_error(probe_st, probe_detail)
+                explain_fail(f"[{i}/{len(chosen)}] {full} (credential probe)",
+                             "Snyk API", IMPORT_ENDPOINT, probe_st, probe_detail,
+                             why, suggest)
                 log_fail("ABORTING RUN before deleting anything: imports are not "
                          "working, so a delete could not be undone.")
                 write_csv(inventory, CSV_FILE)
@@ -1332,15 +1568,8 @@ def run_once(apply_changes, scope=None):
                 # the webhook will not come back, so this must not be silent.
                 log_fail(f"[{i}/{len(chosen)}] {full}: {why}")
 
-        owner, _, name = full.partition("/")
-        # The asset already carries the real default branch; only fall back to
-        # a GitHub lookup when it does not.
-        branch = info.get("branch") or default_branch(full)
-        if not branch:
-            log_warn(f"{full}: could not read default branch from GitHub; "
-                     "letting Snyk resolve it")
-        ok, detail, existed = import_target(info["org_id"], integration_id,
-                                            owner, name, branch)
+        ok, detail, existed, status = import_target(info["org_id"], integration_id,
+                                                    owner, name, branch)
 
         rec = state["repos"].setdefault(norm(full), {"attempts": 0})
         rec["attempts"] += 1
@@ -1364,12 +1593,15 @@ def run_once(apply_changes, scope=None):
                 needs_manual.append(full)
         else:
             fail_count += 1
-            rec["last_result"] = detail
-            log_fail(f"[{i}/{len(chosen)}] {full} {dim('-')} {detail}")
+            why, suggest = diagnose_import_error(status, detail)
+            rec["last_result"] = f"HTTP {status}: {detail}"
+            explain_fail(f"[{i}/{len(chosen)}] {full}", "Snyk API",
+                         IMPORT_ENDPOINT, status, detail, why, suggest)
             # An auth failure is not per-repo -- it will fail for every repo.
             # Continuing would delete target after target and recreate none of
-            # them, so stop the run dead.
-            if "401" in detail or "403" in detail:
+            # them, so stop the run dead. Keyed on the status, not on searching
+            # the prose for "401" -- the prose is now the server's own words.
+            if status in (401, 403):
                 save_state(state)
                 log_fail("ABORTING RUN: imports are failing with an auth error. "
                          "Every further repo would be deleted and not restored.")
@@ -1391,7 +1623,7 @@ def run_once(apply_changes, scope=None):
 
     # --- Stage 4: re-check the repos we touched, so the CSV is current ---
     if acted:
-        head("Re-check")
+        step("Re-check")
         item("Repos", f"{len(acted)}")
         fresh = build_inventory(quiet=True)
         for full, _ in acted:
@@ -1504,6 +1736,9 @@ def main():
                     help="actually re-import; without this the run is a dry run")
     ap.add_argument("--schedule", metavar="INTERVAL",
                     help="loop forever at this interval, e.g. 6h. Prefer cron where available.")
+    ap.add_argument("--org", metavar="NAME_OR_ID",
+                    help="act on one Snyk org only (name or id). Without it an "
+                         "interactive run asks; a cron run does every org.")
     ap.add_argument("--scope", choices=["webhook", "unscanned", "both", "none"],
                     help="what to import without prompting: 'webhook' (imported but no "
                          "webhook), 'unscanned' (no target or 0 projects), 'both'. "
@@ -1521,14 +1756,14 @@ def main():
     preflight()
 
     if not args.schedule:
-        sys.exit(run_once(args.apply, args.scope))
+        sys.exit(run_once(args.apply, args.scope, args.org))
 
     interval = parse_interval(args.schedule)
     log(f"Scheduler started: every {args.schedule} ({interval}s). "
         f"{'APPLY' if args.apply else 'DRY RUN'} mode.")
     while True:
         try:
-            run_once(args.apply, args.scope or 'both')
+            run_once(args.apply, args.scope or 'both', args.org)
         except Exception as e:  # a bad run must not kill the scheduler
             log(f"Run failed: {type(e).__name__}: {e}")
         log(f"Sleeping {interval}s until next run")
