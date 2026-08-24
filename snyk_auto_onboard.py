@@ -1349,9 +1349,19 @@ def poll_import_job(url, timeout=IMPORT_JOB_TIMEOUT):
         last = (body.get("status") or "pending").lower()
         if last in ("complete", "completed", "success"):
             logs = body.get("logs") or []
-            made = sum(1 for l in logs if str(l.get("status", "")).lower()
-                       in ("created", "complete", "success"))
-            return "complete", f"{made} project(s) created" if made else "no projects created"
+            # Each entry in `logs` is one TARGET, not one project, and its own
+            # status reads 'complete' the moment Snyk finished looking -- found
+            # something or not. Counting entries therefore reported
+            # "1 project(s) created" for a repo that produced none, while the
+            # UI said "No projects found". The projects are in each entry's
+            # `projects` list, so count those.
+            made = sum(len(l.get("projects") or []) for l in logs)
+            if made:
+                return "complete", f"{made} project(s) created"
+            # Distinct from 'complete': the API call worked, the repo has
+            # nothing Snyk can scan. Reporting this as success is what made the
+            # log disagree with the dashboard.
+            return "empty", "import finished, found nothing scannable (0 projects)"
         if last in ("failed", "error"):
             logs = body.get("logs") or []
             why = next((l.get("name") or str(l) for l in logs), "")
@@ -1642,7 +1652,7 @@ def run_once(apply_changes, scope=None, org=None, integration=None):
 
     # --- Stage 3: import one by one, following each job to completion ---
     step("Import")
-    ok_count = fail_count = 0
+    ok_count = fail_count = empty_count = 0
     acted = []
     needs_manual = []
     # Flipped once an import call has demonstrably worked in this run. Until
@@ -1730,7 +1740,13 @@ def run_once(apply_changes, scope=None, org=None, integration=None):
             # Follow the async job rather than assuming it worked.
             job_status, job_detail = poll_import_job(detail)
             rec["last_result"] = f"{job_status}: {job_detail}"
-            if job_status in ("complete", "unknown", "timeout"):
+            if job_status == "empty":
+                # Counted apart from both: the import worked, the repo has
+                # nothing to scan. Calling it success is how a run reports
+                # progress the dashboard cannot show.
+                empty_count += 1
+                log_warn(f"[{i}/{len(chosen)}] {full} {dim('-')} {job_detail}")
+            elif job_status in ("complete", "unknown", "timeout"):
                 ok_count += 1
                 log_ok(f"[{i}/{len(chosen)}] {full} {dim('-')} {job_detail}")
             else:
@@ -1769,7 +1785,11 @@ def run_once(apply_changes, scope=None, org=None, integration=None):
             time.sleep(IMPORT_DELAY)
 
     head("Result")
-    item("Succeeded", ok_count, green if ok_count else None)
+    item("Projects created", ok_count, green if ok_count else None)
+    item("Nothing scannable", empty_count, yellow if empty_count else green)
+    if empty_count:
+        item("", dim("imported fine, but Snyk found no manifest or supported "
+                     "file - these stay at 0 projects"))
     item("Failed", fail_count, red if fail_count else green)
 
     # --- Stage 4: re-check the repos we touched, so the CSV is current ---
