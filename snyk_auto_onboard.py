@@ -54,6 +54,12 @@ Optional environment:
   SNYK_API_BASE         https://api.snyk.io (default) | api.eu | api.au |
                         api.us. Tokens are region-scoped; the wrong host 401s.
                         No /v1 suffix.
+  SNYK_INTEGRATION      Which GitHub integration to import through: a type
+                        (github | github-enterprise | github-cloud-app) or an
+                        integration uuid. An org can hold several at once and
+                        only one is usually live -- importing through a stale
+                        one fails every repo with a 401 that reads like a token
+                        problem. Overridden by --integration.
   SNYK_IMPORT_ORG_ID    Org for newly discovered repos when the group has more
                         than one org and the owner cannot be matched to an
                         existing org. Unnecessary for single-org groups.
@@ -90,6 +96,12 @@ Optional environment:
 Command line:
 
   --apply               Actually import. Without it the run is a DRY RUN.
+  --integration TYPE_OR_ID
+                        GitHub integration to import through (see
+                        SNYK_INTEGRATION). Without it an interactive run asks;
+                        a non-interactive run with more than one integration
+                        SKIPS the imports rather than guessing, because the
+                        wrong guess 401s on every repo.
   --scope {webhook,unscanned,both,none}
                         What to act on, without prompting:
                           webhook    imported repos whose webhook is missing
@@ -113,6 +125,12 @@ USAGE
   python3 snyk_auto_onboard.py --scope none           # report + CSV only
   python3 snyk_auto_onboard.py --apply --scope both   # repair everything
   python3 snyk_auto_onboard.py --apply --scope webhook  # webhooks only
+
+  # Org on the GitHub Cloud App: the legacy 'github' integration is often still
+  # listed but dead, and the App creates no per-repo webhooks, so the webhook
+  # pass would be all false positives.
+  CHECK_WEBHOOKS=0 python3 snyk_auto_onboard.py --apply \\
+    --integration github-cloud-app --scope unscanned
 
 SCHEDULING EVERY 6 HOURS
 ------------------------
@@ -307,7 +325,7 @@ def log_fail(msg): log(f"{red('✗')} {msg}")
 # number back. "Which step broke, who rejected us, and why" is then answerable
 # from the log alone, without reading this file.
 
-TOTAL_STEPS = 8
+TOTAL_STEPS = 9
 _step_no = 0
 _step_title = "startup"
 
@@ -321,9 +339,10 @@ def step(title):
       3 Coverage            -           computation only
       4 Verification        Snyk API    did last run's imports take effect
       5 Snyk org            -           which org to act on
-      6 Action required     -           which bucket to act on
-      7 Import              Snyk API    POST /v1/org/../import (+GitHub branch)
-      8 Re-check            both        confirm from the source of truth
+      6 GitHub integration  Snyk API    which integration to import through
+      7 Action required     -           which bucket to act on
+      8 Import              Snyk API    POST /v1/org/../import (+GitHub branch)
+      9 Re-check            both        confirm from the source of truth
     """
     global _step_no, _step_title
     _step_no += 1
@@ -566,23 +585,88 @@ def asset_repo_name(asset):
     return name if "/" in name else None
 
 
-_integration_cache = {}
+# The GitHub-family integration types the v1 import endpoint accepts, in the
+# order they are listed to the operator.
+GITHUB_INTEGRATION_TYPES = ("github", "github-enterprise", "github-cloud-app")
+
+# Which integration to import through: an integration TYPE from the list above,
+# or a literal integration UUID. Set from SNYK_INTEGRATION, overridden by
+# --integration, and otherwise filled in by choose_integration().
+_integration_choice = os.environ.get("SNYK_INTEGRATION", "").strip() or None
+
+_integrations_cache = {}
+_integration_warned = set()
+
+
+def _looks_like_uuid(value):
+    return len(value) == 36 and value.count("-") == 4
+
+
+def list_github_integrations(org_id):
+    """{type: uuid} for one org's GitHub-family integrations, cached per org.
+
+    Returns every match rather than the first, because which one is LIVE is not
+    knowable from the type: an org routinely carries a stale legacy entry and a
+    working one side by side.
+    """
+    if org_id not in _integrations_cache:
+        try:
+            body = snyk_get(f"{API_BASE}/v1/org/{org_id}/integrations")
+        except requests.HTTPError:
+            body = {}
+        _integrations_cache[org_id] = {k: body[k] for k in GITHUB_INTEGRATION_TYPES
+                                       if body.get(k)}
+    return _integrations_cache[org_id]
 
 
 def get_github_integration_id(org_id):
-    """Resolve an org's GitHub integration UUID, cached per org."""
-    if org_id in _integration_cache:
-        return _integration_cache[org_id]
-    body = snyk_get(f"{API_BASE}/v1/org/{org_id}/integrations")
-    for key in ("github", "github-enterprise", "github-cloud-app"):
-        if body.get(key):
-            _integration_cache[org_id] = body[key]
-            return body[key]
-    _integration_cache[org_id] = None
+    """The integration UUID to import through for this org, or None.
+
+    An org can hold several GitHub integrations at once -- a legacy user-OAuth
+    'github' entry alongside a live 'github-cloud-app' installation, say -- and
+    only one of them usually still authenticates to GitHub. Importing through
+    the dead one fails every repo with a 401 whose message blames the
+    credentials rather than the choice of integration.
+
+    So a fixed preference order is deliberately NOT used when there is a real
+    choice: this returns None and says what to pass instead. Guessing here cost
+    a whole run against an integration nobody had used in years.
+    """
+    available = list_github_integrations(org_id)
+
+    if _integration_choice:
+        # A literal UUID is honoured exactly as given -- the operator has named
+        # the integration, which need not be one this code enumerates.
+        if _looks_like_uuid(_integration_choice):
+            return _integration_choice
+        chosen = available.get(_integration_choice)
+        if not chosen and org_id not in _integration_warned:
+            _integration_warned.add(org_id)
+            log_warn(f"org {org_id[:8]}: no '{_integration_choice}' integration "
+                     f"(has: {', '.join(available) or 'none'})")
+        return chosen
+
+    if not available:
+        return None
+    if len(available) == 1:
+        return next(iter(available.values()))
+
+    if org_id not in _integration_warned:
+        _integration_warned.add(org_id)
+        log_warn(f"org {org_id[:8]}: {len(available)} GitHub integrations "
+                 f"({', '.join(available)}) and none chosen -- pass "
+                 "--integration <type|uuid>. Skipping rather than guessing.")
     return None
 
 
-IMPORT_ENDPOINT = "POST /v1/org/{org}/integrations/{integration}/import"
+def import_endpoint(org_id, integration_id):
+    """The import URL as actually called, for failure messages.
+
+    Built from the real ids rather than a template: 'which integration did it
+    try' is the first question a 401 here raises, and a message showing
+    '{integration}' verbatim cannot answer it.
+    """
+    return f"POST /v1/org/{org_id}/integrations/{integration_id}/import"
 
 
 def import_target(org_id, integration_id, owner, name, branch):
@@ -1375,6 +1459,67 @@ def choose_org(work, preset):
     return {oid for oid, _ in keys}
 
 
+def choose_integration(org_ids, preset):
+    """Pick the GitHub integration to import through. Sets _integration_choice.
+
+    Listed per type with the orgs each covers, because the choice is global to
+    the run while the ids are per org: choosing 'github-cloud-app' means "the
+    cloud-app integration of whichever org each repo lives in", not one id.
+    """
+    global _integration_choice
+    step("GitHub integration")
+
+    found = {}
+    for oid in sorted(org_ids):
+        for typ, uuid in list_github_integrations(oid).items():
+            found.setdefault(typ, {})[oid] = uuid
+
+    if not found:
+        log_warn("no GitHub integration on the selected org(s) -- imports will "
+                 "be skipped. Connect one in Settings > Integrations.")
+        return
+
+    types = list(found)
+    for n, typ in enumerate(types, 1):
+        per_org = found[typ]
+        detail = (f"{len(per_org)} org(s)" if len(per_org) > 1
+                  else dim(next(iter(per_org.values()))))
+        item(f"[{n}] {typ}", detail)
+
+    if preset:
+        _integration_choice = preset
+        log(f"Integration: {preset} (from --integration)")
+    elif len(types) == 1:
+        _integration_choice = types[0]
+        item("Using", green(types[0]) + dim("  (only one available)"))
+    elif not sys.stdin.isatty():
+        # Deliberately does NOT default. Picking one unattended is how a run
+        # spends itself 401ing against an integration nobody uses.
+        log_warn("several integrations and no --integration given; imports will "
+                 "be skipped. Non-interactive runs must choose explicitly.")
+        return
+    else:
+        try:
+            ans = input(f"  Which integration? [1-{len(types)}] "
+                        f"(default 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        idx = int(ans) - 1 if ans.isdigit() and 1 <= int(ans) <= len(types) else 0
+        _integration_choice = types[idx]
+        log(f"Integration: {_integration_choice}")
+
+    # The Cloud App does not create per-repo webhooks -- it receives events at
+    # the installation level -- so webhook_state() reports 'missing' for every
+    # repo in such an org. That verdict feeds the destructive bucket, so say so
+    # before the operator picks a bucket rather than after.
+    if _integration_choice == "github-cloud-app" and CHECK_WEBHOOKS:
+        log_warn("github-cloud-app receives events at the App installation, NOT "
+                 "as per-repo webhooks, so the webhook pass reports 'missing' "
+                 "for every repo here. Those are FALSE POSITIVES and the "
+                 "'webhook' bucket would delete and re-import healthy targets. "
+                 "Re-run with CHECK_WEBHOOKS=0 --scope unscanned.")
+
+
 def choose_scope(buckets, preset):
     """Decide which buckets to act on: flag, or prompt when interactive.
 
@@ -1433,7 +1578,7 @@ def select_batch(buckets, scope):
     return buckets["webhook"] + buckets["unscanned"]
 
 
-def run_once(apply_changes, scope=None, org=None):
+def run_once(apply_changes, scope=None, org=None, integration=None):
     """Stage 1 check -> report -> choose -> import one by one -> verify -> CSV.
 
     The CSV is written LAST, deliberately: written before the imports it would
@@ -1470,6 +1615,10 @@ def run_once(apply_changes, scope=None, org=None):
         log("Nothing to do in the selected org(s) -- writing report only.")
         write_csv(inventory, CSV_FILE)
         return 0
+
+    # Before the bucket choice: which integration is live decides whether the
+    # webhook bucket means anything at all (see choose_integration).
+    choose_integration(orgs_wanted, integration)
 
     buckets = classify_work(work)
     chosen = select_batch(buckets, choose_scope(buckets, scope))
@@ -1551,7 +1700,8 @@ def run_once(apply_changes, scope=None, org=None):
             if not probe_ok:
                 why, suggest = diagnose_import_error(probe_st, probe_detail)
                 explain_fail(f"[{i}/{len(chosen)}] {full} (credential probe)",
-                             "Snyk API", IMPORT_ENDPOINT, probe_st, probe_detail,
+                             "Snyk API", import_endpoint(info["org_id"], integration_id),
+                             probe_st, probe_detail,
                              why, suggest)
                 log_fail("ABORTING RUN before deleting anything: imports are not "
                          "working, so a delete could not be undone.")
@@ -1596,7 +1746,8 @@ def run_once(apply_changes, scope=None, org=None):
             why, suggest = diagnose_import_error(status, detail)
             rec["last_result"] = f"HTTP {status}: {detail}"
             explain_fail(f"[{i}/{len(chosen)}] {full}", "Snyk API",
-                         IMPORT_ENDPOINT, status, detail, why, suggest)
+                         import_endpoint(info["org_id"], integration_id),
+                         status, detail, why, suggest)
             # An auth failure is not per-repo -- it will fail for every repo.
             # Continuing would delete target after target and recreate none of
             # them, so stop the run dead. Keyed on the status, not on searching
@@ -1739,6 +1890,13 @@ def main():
     ap.add_argument("--org", metavar="NAME_OR_ID",
                     help="act on one Snyk org only (name or id). Without it an "
                          "interactive run asks; a cron run does every org.")
+    ap.add_argument("--integration", metavar="TYPE_OR_ID",
+                    help="GitHub integration to import through: a type "
+                         "(github, github-enterprise, github-cloud-app) or an "
+                         "integration uuid. An org can hold several and only one "
+                         "is usually live; without this an interactive run asks "
+                         "and a non-interactive run skips rather than guess. "
+                         "Env: SNYK_INTEGRATION.")
     ap.add_argument("--scope", choices=["webhook", "unscanned", "both", "none"],
                     help="what to import without prompting: 'webhook' (imported but no "
                          "webhook), 'unscanned' (no target or 0 projects), 'both'. "
@@ -1756,14 +1914,14 @@ def main():
     preflight()
 
     if not args.schedule:
-        sys.exit(run_once(args.apply, args.scope, args.org))
+        sys.exit(run_once(args.apply, args.scope, args.org, args.integration))
 
     interval = parse_interval(args.schedule)
     log(f"Scheduler started: every {args.schedule} ({interval}s). "
         f"{'APPLY' if args.apply else 'DRY RUN'} mode.")
     while True:
         try:
-            run_once(args.apply, args.scope or 'both', args.org)
+            run_once(args.apply, args.scope or 'both', args.org, args.integration)
         except Exception as e:  # a bad run must not kill the scheduler
             log(f"Run failed: {type(e).__name__}: {e}")
         log(f"Sleeping {interval}s until next run")
