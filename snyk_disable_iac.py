@@ -1,160 +1,229 @@
 #!/usr/bin/env python3
 """
-Bulk-disable Snyk IaC across every Organization in a Group (and optionally
-delete the IaC Projects that were already created).
+Bulk enable/disable Snyk IaC "Detect configuration files" across many Orgs.
 
-There is no Group-level "turn IaC off" switch in Snyk. The only supported
-control is the per-Organization setting, so the way to do this at scale is to
-enumerate the Orgs in the Group and loop.
+THE ENDPOINT (captured from the Snyk web UI, 2026-09-07)
 
-Usage:
-    export SNYK_TOKEN=...                 # Group Admin service account token
-    python snyk_disable_iac.py --group <GROUP_ID> --probe          # inspect only
-    python snyk_disable_iac.py --group <GROUP_ID> --dry-run
-    python snyk_disable_iac.py --group <GROUP_ID> --apply
-    python snyk_disable_iac.py --group <GROUP_ID> --apply --delete-projects
+    PUT https://app.snyk.io/org/{ORG_SLUG}/manage/cloud-config/updateDetectCloudConfigFiles
+    Accept: application/json
+    Content-Type: application/json
+    X-Requested-With: XMLHttpRequest
+    X-CSRF-Token: <per-session token>
+    {"detectCloudConfigFilesEnabled": false}
 
-Notes:
-  * --probe prints the current IaC settings payload for the first few Orgs.
-    RUN THIS FIRST. The public schema for /orgs/{id}/settings/iac documents
-    custom_rules; confirm which attribute your tenant exposes for the
-    "Detect configuration files" toggle before mass-patching.
-  * Disabling the setting does NOT remove existing IaC Projects. Use
-    --delete-projects for that (irreversible: history is lost).
-  * Self-hosted / EU / AU tenants: change API_BASE.
+    Auth is the browser SESSION COOKIE *plus* a CSRF token -- not an API token.
+    Cookie alone returns 403; all four headers are required. The CSRF token is
+    embedded in any authenticated app.snyk.io page as "csrfToken":"..." inside
+    a URL-encoded bootstrap blob. It is session-scoped, not per-org, so this
+    script scrapes it once per run and reuses it for every org.
+
+    This is NOT DOM automation -- one HTTP request per org, so 500 orgs takes
+    about a minute.
+
+    UNSUPPORTED AND UNDOCUMENTED. This is the private endpoint behind the
+    toggle in Org Settings > Snyk IaC. The public REST API has no equivalent:
+    /rest/orgs/{id}/settings/iac only carries custom_rules. Snyk can change or
+    remove this without notice. Fine for internal tooling; do not put it in a
+    customer-facing runbook.
+
+SETUP
+    pip install playwright && playwright install chromium
+
+USAGE
+    export SNYK_TOKEN=...                       # only for --fetch-orgs
+    python disable_iac_ui.py --group <GROUP_ID> --fetch-orgs    # -> orgs.txt
+    python disable_iac_ui.py --login                            # -> snyk_session.json
+    python disable_iac_ui.py --orgs orgs.txt --dry-run
+    python disable_iac_ui.py --orgs orgs.txt --apply
+    python disable_iac_ui.py --orgs orgs.txt --apply --enable    # reverse it
+
+NOTES
+  * Needs Org Admin on every org; others come back 403 and are logged.
+  * progress.json checkpoints after each org, so runs are resumable.
+  * Does NOT delete IaC Projects already imported -- see snyk_iac_bulk.py.
+  * Session cookies expire. A wall of 403s means re-run --login.
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
-import urllib.error
+import urllib.parse
 import urllib.request
 
 API_BASE = "https://api.snyk.io"
+APP_BASE = "https://app.snyk.io"
 REST_VERSION = "2024-10-15"
-IAC_PROJECT_TYPES = [
-    "terraformconfig", "terraformplan", "k8sconfig",
-    "cloudformationconfig", "armconfig", "helmconfig",
+SESSION_FILE = "snyk_session.json"
+PROGRESS_FILE = "progress.json"
+
+ENDPOINT = "{app}/org/{slug}/manage/cloud-config/updateDetectCloudConfigFiles"
+
+# The token appears URL-encoded ("csrfToken"%3A"...") or plain, depending on page.
+CSRF_PATTERNS = [
+    r'csrfToken%22%3A%22([A-Za-z0-9_\-]+)%22',
+    r'"csrfToken"\s*:\s*"([A-Za-z0-9_\-]+)"',
 ]
 
-TOKEN = os.environ.get("SNYK_TOKEN")
-if not TOKEN:
-    sys.exit("Set SNYK_TOKEN (Group Admin service account token).")
 
+def fetch_orgs(group_id, out_path="orgs.txt"):
+    """Org slugs for the group, via the public REST API."""
+    token = os.environ.get("SNYK_TOKEN")
+    if not token:
+        sys.exit("Set SNYK_TOKEN to fetch org slugs.")
 
-def call(method, path, params=None, body=None):
-    url = f"{API_BASE}{path}"
-    params = dict(params or {})
-    if path.startswith("/rest"):
-        params.setdefault("version", REST_VERSION)
-    if params:
-        from urllib.parse import urlencode
-        url += ("&" if "?" in url else "?") + urlencode(params)
-
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", f"token {TOKEN}")
-    if data:
-        req.add_header("Content-Type", "application/vnd.api+json")
-
-    for attempt in range(5):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                raw = r.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            if e.code == 429:                      # rate limited, back off
-                time.sleep(2 ** attempt)
-                continue
-            raise RuntimeError(f"{method} {url} -> {e.code}: {e.read()[:400]}")
-    raise RuntimeError(f"{method} {url} -> rate limited after retries")
-
-
-def list_orgs(group_id):
-    """Every Org in the Group, following REST pagination."""
-    orgs, path, params = [], f"/rest/groups/{group_id}/orgs", {"limit": 100}
+    slugs, path, params = [], f"/rest/groups/{group_id}/orgs", {"limit": 100}
     while path:
-        page = call("GET", path, params)
-        orgs += [(o["id"], o["attributes"].get("name", "")) for o in page.get("data", [])]
-        nxt = page.get("links", {}).get("next")
-        if not nxt:
-            break
-        path, params = nxt, None                   # next link already carries query
-    return orgs
+        url = API_BASE + path
+        if params:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(
+                {**params, "version": REST_VERSION})
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"token {token}")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            page = json.loads(r.read())
+        for o in page.get("data", []):
+            if o["attributes"].get("slug"):
+                slugs.append(o["attributes"]["slug"])
+        path, params = page.get("links", {}).get("next"), None
+
+    with open(out_path, "w") as f:
+        f.write("\n".join(slugs) + "\n")
+    print(f"{len(slugs)} org slugs -> {out_path}")
 
 
-def get_iac_settings(org_id):
-    return call("GET", f"/rest/orgs/{org_id}/settings/iac")
+def login():
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        ctx = browser.new_context()
+        ctx.new_page().goto(f"{APP_BASE}/login")
+        input("Log in (SSO/MFA included), land on the dashboard, then press Enter... ")
+        ctx.storage_state(path=SESSION_FILE)
+        browser.close()
+    print(f"session saved -> {SESSION_FILE}")
 
 
-def disable_iac(org_id, attributes):
-    return call("PATCH", f"/rest/orgs/{org_id}/settings/iac",
-                body={"data": {"type": "iac_settings",
-                               "id": org_id,
-                               "attributes": attributes}})
+def get_csrf(api, probe_slug):
+    """Scrape the session CSRF token out of an authenticated page."""
+    resp = api.get(f"{APP_BASE}/registry/org/{probe_slug}/manage/cloud-config",
+                   timeout=45000)
+    if resp.status != 200:
+        sys.exit(f"Could not load a page to read the CSRF token (HTTP {resp.status}). "
+                 f"Session probably expired -- re-run --login.")
+    html = resp.text()
+    for pat in CSRF_PATTERNS:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    sys.exit("Could not find csrfToken in the page. The UI may have changed; "
+             "re-capture it from DevTools (Network > the PUT > x-csrf-token).")
 
 
-def iac_projects(org_id):
-    projs, path = [], f"/rest/orgs/{org_id}/projects"
-    params = {"limit": 100, "types": ",".join(IAC_PROJECT_TYPES)}
-    while path:
-        page = call("GET", path, params)
-        projs += [(p["id"], p["attributes"].get("name", "")) for p in page.get("data", [])]
-        nxt = page.get("links", {}).get("next")
-        if not nxt:
-            break
-        path, params = nxt, None
-    return projs
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def run(orgs_path, apply_changes, enable, delay):
+    from playwright.sync_api import sync_playwright
+
+    if not os.path.exists(SESSION_FILE):
+        sys.exit(f"No {SESSION_FILE}. Run --login first.")
+    with open(orgs_path) as f:
+        slugs = [ln.strip() for ln in f if ln.strip()]
+    if not slugs:
+        sys.exit(f"{orgs_path} is empty.")
+
+    target = bool(enable)
+    prog = load_progress()
+    todo = [s for s in slugs if prog.get(s) != "ok"]
+
+    print(f"{len(slugs)} orgs, {len(todo)} to do | "
+          f"detectCloudConfigFilesEnabled -> {target} | "
+          f"{'APPLY' if apply_changes else 'DRY RUN'}\n")
+
+    if not apply_changes:
+        for s in todo[:10]:
+            print(f"  would PUT {ENDPOINT.format(app=APP_BASE, slug=s)}")
+        if len(todo) > 10:
+            print(f"  ... and {len(todo)-10} more")
+        print(f'\n  body: {{"detectCloudConfigFilesEnabled": {str(target).lower()}}}')
+        return
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(storage_state=SESSION_FILE)
+        api = ctx.request                      # shares the session cookie jar
+
+        csrf = get_csrf(api, slugs[0])
+        print(f"csrf token acquired ({len(csrf)} chars)\n")
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-Token": csrf,
+        }
+
+        for i, slug in enumerate(todo, 1):
+            url = ENDPOINT.format(app=APP_BASE, slug=slug)
+            try:
+                resp = api.put(
+                    url,
+                    headers={**headers, "Referer": f"{APP_BASE}/registry/org/{slug}"
+                                                   f"/manage/cloud-config"},
+                    data=json.dumps({"detectCloudConfigFilesEnabled": target}),
+                    timeout=30000,
+                )
+                prog[slug] = "ok" if resp.status == 200 else f"http-{resp.status}"
+            except Exception as e:
+                prog[slug] = f"error:{type(e).__name__}"
+
+            with open(PROGRESS_FILE, "w") as f:
+                json.dump(prog, f, indent=2)
+            print(f"[{i}/{len(todo)}] {slug:45s} {prog[slug]}")
+            if delay:
+                time.sleep(delay)
+
+        browser.close()
+
+    counts = {}
+    for v in prog.values():
+        counts[v] = counts.get(v, 0) + 1
+    print("\nsummary:", counts)
+    if any(k.startswith("http-403") for k in counts):
+        print("403 = not Org Admin there, expired session (--login), "
+              "or a stale CSRF token (just re-run).")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--group", required=True)
-    ap.add_argument("--probe", action="store_true", help="print current settings, change nothing")
+    ap.add_argument("--group")
+    ap.add_argument("--fetch-orgs", action="store_true")
+    ap.add_argument("--login", action="store_true")
+    ap.add_argument("--orgs", default="orgs.txt")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--delete-projects", action="store_true")
-    ap.add_argument("--attributes", default='{"custom_rules": {"is_enabled": false}}',
-                    help="JSON attributes body to PATCH; adjust after --probe")
+    ap.add_argument("--enable", action="store_true",
+                    help="turn detection back ON instead of off")
+    ap.add_argument("--delay", type=float, default=0.2)
     args = ap.parse_args()
 
-    orgs = list_orgs(args.group)
-    print(f"{len(orgs)} Organizations in group {args.group}\n")
-
-    if args.probe:
-        for org_id, name in orgs[:3]:
-            print(f"--- {name} ({org_id})")
-            print(json.dumps(get_iac_settings(org_id), indent=2))
-        return
-
-    attributes = json.loads(args.attributes)
-    ok = failed = deleted = 0
-
-    for org_id, name in orgs:
-        if args.dry_run:
-            print(f"[dry-run] would PATCH {name} ({org_id}) with {attributes}")
-        elif args.apply:
-            try:
-                disable_iac(org_id, attributes)
-                ok += 1
-                print(f"[ok] {name} ({org_id})")
-            except Exception as e:
-                failed += 1
-                print(f"[FAIL] {name} ({org_id}): {e}")
-                continue
-
-        if args.delete_projects:
-            for pid, pname in iac_projects(org_id):
-                if args.dry_run:
-                    print(f"    [dry-run] would delete project {pname} ({pid})")
-                else:
-                    call("DELETE", f"/rest/orgs/{org_id}/projects/{pid}")
-                    deleted += 1
-                    print(f"    [deleted] {pname} ({pid})")
-
-    print(f"\ndone: {ok} updated, {failed} failed, {deleted} projects deleted")
+    if args.fetch_orgs:
+        if not args.group:
+            sys.exit("--fetch-orgs needs --group")
+        fetch_orgs(args.group)
+    elif args.login:
+        login()
+    elif args.dry_run or args.apply:
+        run(args.orgs, args.apply, args.enable, args.delay)
+    else:
+        ap.print_help()
 
 
 if __name__ == "__main__":
