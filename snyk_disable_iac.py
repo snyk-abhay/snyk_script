@@ -23,24 +23,41 @@ THE ENDPOINT (captured from the Snyk web UI, 2026-09-07)
     UNSUPPORTED AND UNDOCUMENTED. This is the private endpoint behind the
     toggle in Org Settings > Snyk IaC. The public REST API has no equivalent:
     /rest/orgs/{id}/settings/iac only carries custom_rules. Snyk can change or
-    remove this without notice. Fine for internal tooling; do not put it in a
-    customer-facing runbook.
+    remove this without notice.
 
 SETUP
     pip install playwright && playwright install chromium
 
 USAGE
-    export SNYK_TOKEN=...                       # only for --fetch-orgs
+    set SNYK_TOKEN=...                          # only for --fetch-orgs
     python disable_iac_ui.py --group <GROUP_ID> --fetch-orgs    # -> orgs.txt
     python disable_iac_ui.py --login                            # -> snyk_session.json
     python disable_iac_ui.py --orgs orgs.txt --dry-run
     python disable_iac_ui.py --orgs orgs.txt --apply
     python disable_iac_ui.py --orgs orgs.txt --apply --enable    # reverse it
 
+CORPORATE TLS PROXY (Zscaler / Netskope / Bluecoat etc.)
+    Symptom: "unable to get local issuer certificate"
+
+    Proper fix -- point Node at your corporate root CA, then run normally:
+        Windows:  set NODE_EXTRA_CA_CERTS=C:\\path\\to\\corp-root-ca.pem
+        macOS:    export NODE_EXTRA_CA_CERTS=/path/to/corp-root-ca.pem
+
+    Quick fix -- skip certificate validation for this run:
+        python disable_iac_ui.py --orgs orgs.txt --apply --insecure
+
+    Use --insecure only on a trusted network; it disables cert checking for
+    the requests this script makes.
+
+REGIONS
+    Non-US tenants: change APP_BASE / API_BASE to your region, e.g.
+    https://app.eu.snyk.io + https://api.eu.snyk.io. The `snyk.region` cookie
+    in your browser tells you which one you are on (SNYK-US-01 = defaults).
+
 NOTES
   * Needs Org Admin on every org; others come back 403 and are logged.
   * progress.json checkpoints after each org, so runs are resumable.
-  * Does NOT delete IaC Projects already imported -- see snyk_iac_bulk.py.
+  * Does NOT delete IaC Projects already imported -- separate job.
   * Session cookies expire. A wall of 403s means re-run --login.
 """
 
@@ -61,11 +78,16 @@ PROGRESS_FILE = "progress.json"
 
 ENDPOINT = "{app}/org/{slug}/manage/cloud-config/updateDetectCloudConfigFiles"
 
-# The token appears URL-encoded ("csrfToken"%3A"...") or plain, depending on page.
 CSRF_PATTERNS = [
     r'csrfToken%22%3A%22([A-Za-z0-9_\-]+)%22',
     r'"csrfToken"\s*:\s*"([A-Za-z0-9_\-]+)"',
 ]
+
+TLS_HINT = (
+    "\nTLS error -- your machine is behind a certificate-inspecting proxy.\n"
+    "  Fix properly:  set NODE_EXTRA_CA_CERTS=C:\\path\\to\\corp-root-ca.pem\n"
+    "  Or bypass:     add --insecure to this command\n"
+)
 
 
 def fetch_orgs(group_id, out_path="orgs.txt"):
@@ -94,11 +116,11 @@ def fetch_orgs(group_id, out_path="orgs.txt"):
     print(f"{len(slugs)} org slugs -> {out_path}")
 
 
-def login():
+def login(insecure):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        ctx = browser.new_context()
+        ctx = browser.new_context(ignore_https_errors=insecure)
         ctx.new_page().goto(f"{APP_BASE}/login")
         input("Log in (SSO/MFA included), land on the dashboard, then press Enter... ")
         ctx.storage_state(path=SESSION_FILE)
@@ -108,8 +130,13 @@ def login():
 
 def get_csrf(api, probe_slug):
     """Scrape the session CSRF token out of an authenticated page."""
-    resp = api.get(f"{APP_BASE}/registry/org/{probe_slug}/manage/cloud-config",
-                   timeout=45000)
+    try:
+        resp = api.get(f"{APP_BASE}/registry/org/{probe_slug}/manage/cloud-config",
+                       timeout=45000)
+    except Exception as e:
+        if "issuer certificate" in str(e) or "SSL" in str(e) or "CERT" in str(e).upper():
+            sys.exit(TLS_HINT)
+        raise
     if resp.status != 200:
         sys.exit(f"Could not load a page to read the CSRF token (HTTP {resp.status}). "
                  f"Session probably expired -- re-run --login.")
@@ -129,7 +156,7 @@ def load_progress():
     return {}
 
 
-def run(orgs_path, apply_changes, enable, delay):
+def run(orgs_path, apply_changes, enable, delay, insecure):
     from playwright.sync_api import sync_playwright
 
     if not os.path.exists(SESSION_FILE):
@@ -145,7 +172,8 @@ def run(orgs_path, apply_changes, enable, delay):
 
     print(f"{len(slugs)} orgs, {len(todo)} to do | "
           f"detectCloudConfigFilesEnabled -> {target} | "
-          f"{'APPLY' if apply_changes else 'DRY RUN'}\n")
+          f"{'APPLY' if apply_changes else 'DRY RUN'}"
+          f"{' | INSECURE TLS' if insecure else ''}\n")
 
     if not apply_changes:
         for s in todo[:10]:
@@ -157,7 +185,8 @@ def run(orgs_path, apply_changes, enable, delay):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(storage_state=SESSION_FILE)
+        ctx = browser.new_context(storage_state=SESSION_FILE,
+                                  ignore_https_errors=insecure)
         api = ctx.request                      # shares the session cookie jar
 
         csrf = get_csrf(api, slugs[0])
@@ -175,8 +204,9 @@ def run(orgs_path, apply_changes, enable, delay):
             try:
                 resp = api.put(
                     url,
-                    headers={**headers, "Referer": f"{APP_BASE}/registry/org/{slug}"
-                                                   f"/manage/cloud-config"},
+                    headers={**headers,
+                             "Referer": f"{APP_BASE}/registry/org/{slug}"
+                                        f"/manage/cloud-config"},
                     data=json.dumps({"detectCloudConfigFilesEnabled": target}),
                     timeout=30000,
                 )
@@ -211,6 +241,8 @@ def main():
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--enable", action="store_true",
                     help="turn detection back ON instead of off")
+    ap.add_argument("--insecure", action="store_true",
+                    help="skip TLS cert validation (corporate proxy workaround)")
     ap.add_argument("--delay", type=float, default=0.2)
     args = ap.parse_args()
 
@@ -219,9 +251,9 @@ def main():
             sys.exit("--fetch-orgs needs --group")
         fetch_orgs(args.group)
     elif args.login:
-        login()
+        login(args.insecure)
     elif args.dry_run or args.apply:
-        run(args.orgs, args.apply, args.enable, args.delay)
+        run(args.orgs, args.apply, args.enable, args.delay, args.insecure)
     else:
         ap.print_help()
 
