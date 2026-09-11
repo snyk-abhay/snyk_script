@@ -2674,6 +2674,18 @@ body{
 a{color:${C.accent};text-decoration:none;border-bottom:1px solid rgba(111,0,221,.25)}
 a:hover{color:${C.accentHover};border-bottom-color:${C.accentHover}}
 
+/* ---- clean bill of health ------------------------------------------
+   The scope table on a zero-findings report. It is the only evidence the
+   document carries, so it is set as a record, not as prose. */
+.cb{margin:10px 0 0;border-top:1px solid ${C.line}}
+.cb-row{display:flex;gap:12px;padding:6px 0;border-bottom:1px solid ${C.line};align-items:baseline}
+.cb-k{flex:0 0 130px;font-family:${FONT_MONO};font-size:9.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:${C.subtle}}
+.cb-v{flex:1;font-size:12.5px;line-height:1.6;display:flex;flex-wrap:wrap;gap:4px}
+.cb-tag{font-family:${FONT_MONO};font-size:11px;background:${C.paper};
+  border:1px solid ${C.line};border-radius:3px;padding:1px 6px}
+.cb-tag--more{color:${C.subtle};border-style:dashed}
+
 /* ---- page frame ---------------------------------------------------- */
 .report{display:flex;flex-direction:column;align-items:center;gap:20px;padding:24px 0 60px}
 .page{
@@ -3276,19 +3288,45 @@ function execPage(ctx) {
 function cleanBill(ctx) {
   const { data, meta } = ctx;
   const filtered = meta.rowsRead > 0 && data.total === 0 && meta.sourceHadFindings;
+  const named = (label, names) => {
+    const shown = names.slice(0, 40);
+    const rest = names.length - shown.length;
+    return `<div class="cb-row"><div class="cb-k">${esc(label)} (${fmt(names.length)})</div>
+      <div class="cb-v">${shown.map((n) => `<span class="cb-tag">${esc(n)}</span>`).join("")}${rest > 0 ? `<span class="cb-tag cb-tag--more">+${fmt(rest)} more</span>` : ""}</div></div>`;
+  };
+  const targets = meta.scopeTargets ?? [];
+  const projects = meta.scopeProjects ?? [];
+  const coverage = targets.length ? meta.targetsWereFiltered ? `Every target listed below was examined and returned nothing.` : `No target filter was applied, so this covers the whole organisation.
+         The targets it contains are listed below; all of them returned nothing.` : `No target names are recorded for this run, so this page can attest to the
+       scope named above but cannot enumerate the individual repositories inside it.`;
+  const scopeBlock = `<div class="cb">
+    <div class="cb-row"><div class="cb-k">Scope</div><div class="cb-v">${esc(meta.scope)}</div></div>
+    ${// Skip when the scope line already says it, rather than printing the
+  // same organisation name twice under two different labels.
+  meta.orgLabel && !meta.scope.includes(meta.orgLabel) ? `<div class="cb-row"><div class="cb-k">Organisation</div><div class="cb-v">${esc(meta.orgLabel)}</div></div>` : ""}
+    ${targets.length ? named(meta.targetsWereFiltered ? "Targets examined" : "Targets in scope", targets) : ""}
+    ${projects.length ? named("Projects", projects) : ""}
+    <div class="cb-row"><div class="cb-k">Period</div><div class="cb-v">${esc(
+    meta.period ?? meta.dataAsOf ?? "Point-in-time snapshot"
+  )}</div></div>
+  </div>`;
   if (filtered) {
-    return `<div class="note note--good"><div class="note__t">Nil return</div>
-      <p>No issue matched the filters recorded on the previous page. The data was read
-      successfully and did contain findings; none of them meet these criteria. This is a
-      statement about the filter, not about the estate.</p></div>`;
+    return `<div class="note note--good"><div class="note__t">Nil return \u2014 no issue matched the filters</div>
+      <p>The data was read successfully and did contain findings; none of them meet the
+      criteria recorded on the previous page. This is a statement about the filter, not
+      about the estate \u2014 do not read it as a clean bill of health.</p>
+      ${scopeBlock}</div>`;
   }
   const scanned = ctx.scannersRequested.length ? ctx.scannersRequested : ["open-source", "code", "container", "iac", "secrets"];
   const lines = scanned.map(
     (p) => `<li><b>${esc(productLabel(p))}</b> \u2014 no ${esc(productShort(p))} findings</li>`
   ).join("");
-  return `<div class="note note--good"><div class="note__t">Clean \u2014 no vulnerabilities found</div>
-    <p>The data for this scope was read successfully and contains no findings at all.</p>
-    <ul style="margin:8px 0 0;padding-left:18px;font-size:12.5px;line-height:1.7">${lines}</ul>
+  const headline = targets.length === 1 ? `Clean \u2014 no vulnerabilities in ${esc(targets[0])}` : targets.length > 1 ? `Clean \u2014 no vulnerabilities across ${fmt(targets.length)} targets` : "Clean \u2014 no vulnerabilities found";
+  return `<div class="note note--good"><div class="note__t">${headline}</div>
+    <p>Snyk returned no findings at all for the scope below. ${coverage}</p>
+    ${scopeBlock}
+    <div class="cb-k" style="margin:12px 0 4px">Scanners run</div>
+    <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.7">${lines}</ul>
     <p style="margin-top:10px"><b>Not covered:</b> DAST. Snyk API &amp; Web is a separate
     platform that this report cannot read, so this result says nothing about dynamic testing.
     Anything outside the filters on the previous page is likewise out of scope.</p></div>`;
@@ -4457,6 +4495,8 @@ async function main() {
   let severities = [...SEVERITIES];
   let apiClient = null;
   let projectFilter;
+  let targetFilter;
+  let scopeOrgIds;
   let formatSpec = values.format;
   if (useApi) {
     const conn = await connect({ region: values.region, token: process.env["SNYK_TOKEN"] });
@@ -4470,6 +4510,8 @@ async function main() {
     });
     scopeLabel = selection.scope.label;
     projectFilter = selection.projectNames;
+    targetFilter = selection.targetNames;
+    scopeOrgIds = selection.orgIds ?? (selection.scope.kind === "orgs" ? [selection.scope.id] : void 0);
     const since = await selectSince(values.since);
     periodLabel = describeSince(since);
     const filters = {
@@ -4600,6 +4642,12 @@ async function main() {
       );
     }
   }
+  let examinedTargets = targetFilter;
+  if (!examinedTargets?.length && issues.length === 0 && apiClient && scopeOrgIds?.length === 1) {
+    const found = await tryList("targets", () => listTargets(apiClient, scopeOrgIds[0]));
+    if (found?.length) examinedTargets = found.map((t) => t.name);
+  }
+  const scopeWithTargets = scopeLabel && targetFilter?.length ? `${scopeLabel} - ${targetFilter.length === 1 ? targetFilter[0] : `${fmt2(targetFilter.length)} targets`}` : scopeLabel;
   if (!values.format && isInteractive()) {
     formatSpec = (await selectFormats(void 0)).join(",");
   }
@@ -4663,11 +4711,20 @@ async function main() {
     generatedAt: (/* @__PURE__ */ new Date()).toLocaleString(void 0, { dateStyle: "long", timeStyle: "short" }),
     sourceLabel,
     sourceDetail,
-    scope: scopeLabel ?? describeScope(issues),
+    // describeScope() reads the issues, so with none it returns
+    // "0 organisations" -- true, useless, and alarming on a clean report.
+    // Name the file instead; that is what the reader needs to identify.
+    scope: scopeWithTargets ?? (issues.length ? describeScope(issues) : sourceDetail ?? sourceLabel),
     // From the examined set, not the filtered one, so a nil return still
     // names the organisation it examined.
-    orgLabel: [...new Set(issues.map((i) => i.org.name ?? i.org.id))].join(", ") || void 0,
+    // ... and when there are no issues at all, fall back to the scope that
+    // was requested. Without this a clean report names no organisation
+    // anywhere and the running header reads "this organisation".
+    orgLabel: [...new Set(issues.map((i) => i.org.name ?? i.org.id))].join(", ") || scopeLabel || void 0,
     scannersRequested: wantProducts,
+    ...examinedTargets?.length ? { scopeTargets: examinedTargets } : {},
+    ...projectFilter?.length ? { scopeProjects: projectFilter } : {},
+    targetsWereFiltered: Boolean(targetFilter?.length),
     sourceHadFindings: issues.length > 0,
     filters: [
       `period: ${periodLabel}`,
@@ -4675,6 +4732,7 @@ async function main() {
       `scanners: ${wantProducts.length === new Set(issues.map((i) => i.product)).size ? "all" : wantProducts.join(", ")}`,
       values["include-deleted"] ? "including deleted issues" : "excluding deleted issues",
       `status: ${wantStatuses.length === 3 ? "all" : wantStatuses.join(", ")}`,
+      ...targetFilter?.length ? [`targets: ${targetFilter.join(", ")}`] : [],
       ...projectFilter ? [`projects: ${projectFilter.join(", ")}`] : []
     ].join("; "),
     ...regionLabel ? { region: regionLabel } : {},
