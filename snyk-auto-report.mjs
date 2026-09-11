@@ -3147,10 +3147,10 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
    the contents list and the detail flow were all cropped mid-content.
    The page box is the only thing that repeats per sheet, so the margin
    belongs here. */
-@page{size:A4;margin:12mm 10mm}
-/* The cover keeps a full bleed so its dark band reaches the paper edge; it
-   supplies its own inset internally. */
-@page :first{margin:0}
+@page{size:A4}
+/* Margins and the running header/footer are emitted per report by
+   pageBoxCss() in html.mts, which needs the report's own title and holder
+   strings; only the sheet size is static enough to live here. */
 @media print{
   body{background:${C.paper}}
   .no-print{display:none!important}
@@ -3166,6 +3166,9 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
   .page{box-shadow:none!important;margin:0!important;padding:0!important;
     width:auto!important;min-height:0!important;break-after:page;break-inside:auto}
   .page:last-of-type{break-after:auto}
+  /* The page-box running header/footer replace these in print; leaving
+     both would print the section header twice on a section's first sheet. */
+  .rh,.rf{display:none!important}
   .avoid-break{break-inside:avoid}
   a{color:${C.ink};border-bottom:0}
   a[href]:after{content:""}
@@ -4172,6 +4175,29 @@ var SEV_NOTE = {
   medium: "CVSS 4.0\u20136.9. Limited impact, or meaningful exploitation barriers such as authentication or local access.",
   low: "CVSS 0.1\u20133.9. Minimal direct impact; hardening and defence-in-depth items."
 };
+function pageBoxCss(ctx) {
+  const title = cssString(ctx.meta.title);
+  const holder = cssString(ctx.holder);
+  const mark = cssString(ctx.classification);
+  const face = `font-family:${FONT_MONO};font-size:7.5pt;letter-spacing:.08em;color:${C.subtle}`;
+  return `@page{
+  margin:17mm 10mm 15mm;
+  @top-left{content:${title};${face};vertical-align:bottom;padding-bottom:3mm}
+  @top-right{content:${holder};${face};vertical-align:bottom;padding-bottom:3mm}
+  @bottom-left{content:${mark};${face};vertical-align:top;padding-top:3mm}
+  @bottom-right{content:"Page " counter(page);${face};vertical-align:top;padding-top:3mm}
+}
+/* The cover bleeds to the paper edge, so it has no margin for a box to sit
+   in; blank them explicitly rather than relying on the zero margin. */
+@page :first{
+  margin:0;
+  @top-left{content:""} @top-right{content:""}
+  @bottom-left{content:""} @bottom-right{content:""}
+}`;
+}
+function cssString(v) {
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ")}"`;
+}
 function page(ctx, id, bodyHtml, footRight, cls = "") {
   return `<section class="page ${cls}" data-page="${id}">
   ${runHead(ctx.meta.title, ctx.holder)}
@@ -4306,7 +4332,8 @@ function renderHtml(data, availability, meta) {
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(meta.title)} \u2014 Snyk Vulnerability Report</title>
-<style>${CSS}</style></head>
+<style>${CSS}</style>
+<style>${pageBoxCss(ctx)}</style></head>
 <body><div class="report">
 ${coverPage(ctx)}
 ${detailsPage(ctx)}
