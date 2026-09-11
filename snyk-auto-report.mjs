@@ -42,30 +42,6 @@ function makeAvailability(source, entries) {
   }
   return { sources: /* @__PURE__ */ new Set([source]), byField };
 }
-function mergeAvailability(parts) {
-  const sources = /* @__PURE__ */ new Set();
-  const keys = /* @__PURE__ */ new Set();
-  for (const p of parts) {
-    for (const s of p.sources) sources.add(s);
-    for (const k of p.byField.keys()) keys.add(k);
-  }
-  const byField = /* @__PURE__ */ new Map();
-  for (const k of keys) {
-    const seen = parts.map((p) => p.byField.get(k)).filter((e) => e !== void 0);
-    const carriedBy = /* @__PURE__ */ new Set();
-    for (const e of seen) for (const s of e.carriedBy) carriedBy.add(s);
-    const anyCarried = carriedBy.size > 0;
-    const allCarried = anyCarried && carriedBy.size === sources.size;
-    const worst = seen.find((e) => e.state === "absent") ?? seen.find((e) => e.state === "partial") ?? seen[0];
-    byField.set(k, {
-      state: allCarried ? "carried" : anyCarried ? "partial" : "absent",
-      reason: anyCarried ? "carried" : worst.reason,
-      note: worst.note,
-      carriedBy
-    });
-  }
-  return { sources, byField };
-}
 function stateOf(a, key2) {
   return a.byField.get(key2)?.state ?? "absent";
 }
@@ -1896,140 +1872,6 @@ async function ingestTestsApiFindings(client, orgId, testId, components, opts) {
       keyStrength: "strong",
       weakKeyCollisions: 0
     }
-  };
-}
-var GITHUB_ORIGIN_BASE = {
-  github: "https://github.com",
-  "github-cloud-app": "https://github.com"
-};
-function compositeKey(problemId, filePath, startLine) {
-  return `${problemId}|${filePath}|${startLine ?? ""}`;
-}
-function indexFresh(list2) {
-  const byAssetId = /* @__PURE__ */ new Map();
-  const byComposite = /* @__PURE__ */ new Map();
-  for (const issue of list2) {
-    const afid = read(issue, "assetFindingId");
-    if (afid.state === "present") {
-      const arr = byAssetId.get(afid.value) ?? [];
-      arr.push(issue);
-      byAssetId.set(afid.value, arr);
-    }
-    const fp = read(issue, "filePath");
-    if (fp.state === "present") {
-      const region = read(issue, "codeRegion");
-      const line = region.state === "present" ? region.value.startLine ?? null : null;
-      const key2 = compositeKey(issue.problemId, fp.value, line);
-      const arr = byComposite.get(key2) ?? [];
-      arr.push(issue);
-      byComposite.set(key2, arr);
-    }
-  }
-  return { byAssetId, byComposite };
-}
-function findMatch(original, fresh) {
-  const afid = read(original, "assetFindingId");
-  if (afid.state === "present") {
-    const candidates = fresh.byAssetId.get(afid.value);
-    if (candidates?.length === 1) return candidates[0];
-  }
-  const fp = read(original, "filePath");
-  if (fp.state === "present") {
-    const region = read(original, "codeRegion");
-    const line = region.state === "present" ? region.value.startLine ?? null : null;
-    const candidates = fresh.byComposite.get(compositeKey(original.problemId, fp.value, line));
-    if (candidates?.length === 1) return candidates[0];
-  }
-  return null;
-}
-function groupSastTargets(issues) {
-  const groups = /* @__PURE__ */ new Map();
-  let skipped = 0;
-  for (const issue of issues) {
-    if (issue.product !== "code") continue;
-    const origin = (issue.project?.origin ?? "").toLowerCase();
-    const targetName = issue.project?.targetDisplayName;
-    const ref = issue.project?.targetRef;
-    const base = GITHUB_ORIGIN_BASE[origin];
-    if (!base || !targetName || !ref) {
-      skipped++;
-      continue;
-    }
-    const repoUrl = `${base}/${targetName}`;
-    const key2 = `${issue.org.id}::${repoUrl}::${ref}`;
-    let g = groups.get(key2);
-    if (!g) {
-      g = { orgId: issue.org.id, repoUrl, ref, issues: [] };
-      groups.set(key2, g);
-    }
-    g.issues.push(issue);
-  }
-  return { targets: [...groups.values()], skipped };
-}
-async function fetchGithubIntegrationId(client, orgId) {
-  orgId = validId(orgId, "--org");
-  const integrations = await client.get(`/v1/org/${orgId}/integrations`);
-  const id = integrations["github"] ?? integrations["github-cloud-app"];
-  if (!id) {
-    throw new Error(
-      `org ${orgId} has no GitHub integration configured (checked "github" and "github-cloud-app")`
-    );
-  }
-  return id;
-}
-async function enrichSastWithDataflow(client, issues, opts = {}) {
-  const { targets, skipped } = groupSastTargets(issues);
-  const byOriginal = /* @__PURE__ */ new Map();
-  const failed = [];
-  const integrationCache = /* @__PURE__ */ new Map();
-  let matched = 0;
-  for (const target of targets) {
-    log.step(`Scanning ${target.repoUrl} (${target.ref}) for dataflow -- ${target.issues.length} SAST issue(s)`);
-    try {
-      let integrationId = integrationCache.get(target.orgId);
-      if (!integrationId) {
-        integrationId = await fetchGithubIntegrationId(client, target.orgId);
-        integrationCache.set(target.orgId, integrationId);
-      }
-      const jobId = await startCodeTest(client, target.orgId, {
-        repoUrl: target.repoUrl,
-        integrationId,
-        ref: target.ref
-      });
-      const testId = await waitForCodeTest(client, target.orgId, jobId, {
-        timeoutMs: opts.scanTimeoutMs ?? 10 * 6e4
-      });
-      const components = await fetchTestComponents(client, target.orgId, testId);
-      const freshOutcome = await ingestTestsApiFindings(client, target.orgId, testId, components, {
-        org: target.issues[0].org
-      });
-      const index = indexFresh(freshOutcome.issues);
-      for (const original of target.issues) {
-        const match = findMatch(original, index);
-        if (!match) continue;
-        const flow = read(match, "dataflow");
-        byOriginal.set(original, { ...original, dataflow: flow.state === "present" ? flow.value : null });
-        matched++;
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
-      log.warn(`dataflow scan failed for ${target.repoUrl} (${target.ref}): ${error}`);
-      failed.push({ repoUrl: target.repoUrl, ref: target.ref, error });
-    }
-  }
-  const merged = issues.map((issue) => byOriginal.get(issue) ?? issue);
-  return {
-    issues: merged,
-    // Declares 'dataflow' as carried by tests-api; the caller merges this
-    // with the base availability only when `matched > 0`, which turns the
-    // field 'partial' rather than 'absent' -- honest, since only the
-    // matched subset actually got one. Every other field's availability is
-    // untouched: this function only ever adds `dataflow`.
-    availability: testsApiAvailability(),
-    targetsScanned: targets.length - failed.length,
-    targetsSkipped: skipped,
-    targetsFailed: failed,
-    matched
   };
 }
 
@@ -4494,17 +4336,6 @@ Pull straight from the Snyk API instead of a file:
                         Results live for 3 days; use this after a timeout
                         rather than spending another of your 20 exports/hour.
   --export-timeout <m>  minutes to wait for the job (default: 30)
-  --no-dataflow         skip the automatic Source->Sink dataflow scan below
-                        for SAST issues (faster; keeps the Export API data
-                        exactly as returned)
-
---from-api automatically attaches Source->Sink dataflow to every SAST issue
-it can: one Tests v2 scan per distinct (repo, branch), matched back onto the
-existing issues so nothing else about them changes. Only issues from a
-GitHub-origin project with a known target branch are scannable; anything
-else is skipped and counted, never guessed. Pass --no-dataflow to turn this
-off and get the plain Export API data faster.
-  --scan-timeout <m>    minutes to wait per dataflow scan (default: 10)
 
 Or run a fresh Snyk Code scan directly and report on just that (also Tests
 v2 API; useful to target one repo without an Export API run first):
@@ -4684,25 +4515,6 @@ async function main() {
     });
     sourceLabel = "Snyk CSV export";
     sourceDetail = csvPath;
-  }
-  if (useApi && apiClient && !values["no-dataflow"]) {
-    const sastCount = outcome.issues.filter((i) => i.product === "code").length;
-    if (sastCount > 0) {
-      log.step(`Attaching Source\u2192Sink dataflow to ${fmt2(sastCount)} SAST issue(s) (--no-dataflow to skip)`);
-      const enrich = await enrichSastWithDataflow(apiClient, outcome.issues, {
-        scanTimeoutMs: (Number(values["scan-timeout"]) || 10) * 6e4
-      });
-      outcome = {
-        issues: enrich.issues,
-        summary: {
-          ...outcome.summary,
-          availability: enrich.matched > 0 ? mergeAvailability([outcome.summary.availability, enrich.availability]) : outcome.summary.availability
-        }
-      };
-      log.info(
-        `dataflow: ${fmt2(enrich.matched)} issue(s) matched across ${fmt2(enrich.targetsScanned)} target(s)` + (enrich.targetsSkipped ? `; ${fmt2(enrich.targetsSkipped)} SAST issue(s) skipped (no resolvable GitHub repo + branch)` : "") + (enrich.targetsFailed.length ? `; ${fmt2(enrich.targetsFailed.length)} target(s) failed` : "")
-      );
-    }
   }
   const { issues, summary } = outcome;
   const d = summary.dropped;
