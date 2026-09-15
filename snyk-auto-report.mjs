@@ -2216,6 +2216,24 @@ ${c.cyan(">")} ${title}
     pool = choices;
   }
 }
+function parseSelection(answer, count) {
+  const picked = /* @__PURE__ */ new Set();
+  for (const part of answer.split(",").map((p) => p.trim()).filter(Boolean)) {
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
+    if (range) {
+      const lo = Number(range[1]);
+      const hi = Number(range[2]);
+      if (lo < 1 || hi > count || lo > hi) return null;
+      for (let i = lo; i <= hi; i++) picked.add(i);
+      continue;
+    }
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 1 || n > count) return null;
+    picked.add(n);
+  }
+  return picked.size > 0 ? [...picked].sort((a, b) => a - b) : null;
+}
+var LOOKS_NUMERIC = /^[\d\s,-]+$/;
 async function chooseMany(title, choices, opts = {}) {
   if (choices.length === 0) return [];
   requireInteractive(title, "--help for the non-interactive flags");
@@ -2230,23 +2248,51 @@ ${c.cyan(">")} ${title}
 `));
     const answer = (await ask(`numbers (e.g. 1,3 or 2-6), or "${allLabel}"`, opts.defaultAll ? allLabel : void 0)).toLowerCase().trim();
     if (answer === allLabel || answer === "*") return choices.map((ch) => ch.value);
-    const picked = /* @__PURE__ */ new Set();
-    let bad = false;
-    for (const part of answer.split(",").map((p) => p.trim()).filter(Boolean)) {
-      const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
-      if (range) {
-        const lo = Number(range[1]);
-        const hi = Number(range[2]);
-        if (lo < 1 || hi > choices.length || lo > hi) bad = true;
-        else for (let i = lo; i <= hi; i++) picked.add(i);
-        continue;
-      }
-      const n = Number(part);
-      if (!Number.isInteger(n) || n < 1 || n > choices.length) bad = true;
-      else picked.add(n);
-    }
-    if (!bad && picked.size > 0) return [...picked].sort((a, b) => a - b).map((i) => choices[i - 1].value);
+    const picked = parseSelection(answer, choices.length);
+    if (picked) return picked.map((i) => choices[i - 1].value);
     stderr.write(c.yellow("  could not read that selection\n"));
+  }
+}
+function interpretAnswer(raw, count, allLabel = "all") {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  if (!trimmed) return { kind: "empty" };
+  if (lower === allLabel || lower === "*") return { kind: "all" };
+  const picked = parseSelection(lower, count);
+  if (picked) return { kind: "indexes", indexes: picked };
+  if (LOOKS_NUMERIC.test(lower)) return { kind: "out-of-range" };
+  return { kind: "text", text: trimmed };
+}
+async function chooseManyOrText(title, choices, opts) {
+  if (choices.length === 0) return { kind: "values", values: [] };
+  requireInteractive(title, "--help for the non-interactive flags");
+  const allLabel = opts.allLabel ?? "all";
+  for (let attempt = 0; ; attempt++) {
+    if (attempt >= 25) throw new Error(`no valid selection for: ${title}`);
+    stderr.write(`
+${c.cyan(">")} ${title}
+`);
+    renderChoices(choices);
+    stderr.write(c.dim(`  or "${allLabel}" for everything, or ${opts.textHint}
+`));
+    const raw = (await ask(`numbers (e.g. 1,3 or 2-6), "${allLabel}", or name(s)`, opts.defaultAll ? allLabel : void 0)).trim();
+    const answer = raw.toLowerCase();
+    const reading = interpretAnswer(raw, choices.length, allLabel);
+    switch (reading.kind) {
+      case "all":
+        return { kind: "values", values: choices.map((ch) => ch.value) };
+      case "indexes":
+        return { kind: "values", values: reading.indexes.map((i) => choices[i - 1].value) };
+      case "text":
+        return { kind: "text", text: reading.text };
+      case "out-of-range":
+        stderr.write(c.yellow(`  no such entry -- the list has ${choices.length} items
+`));
+        continue;
+      default:
+        stderr.write(c.yellow("  could not read that selection\n"));
+        continue;
+    }
   }
 }
 
@@ -2403,25 +2449,28 @@ async function selectScope(conn, opts) {
   if (orgForNarrowing && isInteractive()) {
     const targets = await tryList("targets", () => listTargets(client, orgForNarrowing.id)) ?? [];
     if (targets.length > 1) {
-      const TYPE_IN = "\0__type__";
       for (; ; ) {
-        const chosen = await chooseMany(
+        const answer = await chooseManyOrText(
           `Which targets in ${orgForNarrowing.name}?`,
-          [
-            { value: TYPE_IN, label: c.bold("Type target name(s)..."), hint: "comma separated" },
-            ...targets.map((t) => ({ value: t.name, label: t.name, hint: t.hint }))
-          ],
-          { allLabel: "all", defaultAll: true }
+          targets.map((t) => ({ value: t.name, label: t.name, hint: t.hint })),
+          { allLabel: "all", defaultAll: true, textHint: "type target name(s), comma separated" }
         );
-        if (chosen.includes(TYPE_IN)) {
-          const typed = await askUntilResolved(
-            "Target name(s), comma separated",
-            (v) => resolveTargets(client, orgForNarrowing.id, v.split(","), targets)
-          );
-          if (!typed) continue;
-          targetNames = typed;
-        } else if (chosen.length !== targets.length) {
-          targetNames = chosen;
+        if (answer.kind === "text") {
+          let resolved;
+          try {
+            resolved = await resolveTargets(
+              client,
+              orgForNarrowing.id,
+              answer.text.split(","),
+              targets
+            );
+          } catch (err) {
+            log.warn(err instanceof Error ? err.message : String(err));
+            continue;
+          }
+          targetNames = resolved;
+        } else if (answer.values.length !== targets.length) {
+          targetNames = answer.values;
         }
         break;
       }
