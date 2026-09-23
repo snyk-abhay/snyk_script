@@ -444,11 +444,12 @@ async function listTargets(client, orgId) {
     ["origin"]
   );
 }
-async function tryList(what, fn) {
+async function tryList(what, fn, fallback) {
   try {
     return await fn();
   } catch (err) {
     log.warn(`could not list ${what}: ${err instanceof Error ? err.message : String(err)}`);
+    if (fallback) log.warn(`  continuing with ${fallback}`);
     return null;
   }
 }
@@ -1189,10 +1190,28 @@ var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function backoff(attempt) {
   return Math.min(6e4, 2 ** attempt * 1e3 + Math.floor(Math.random() * 1e3));
 }
+var SAFE_QUERY_PARAMS = /* @__PURE__ */ new Set([
+  "version",
+  "limit",
+  "exclude_empty",
+  "starting_after",
+  "ending_before",
+  "cursor",
+  "url"
+]);
 function redactUrl(url) {
   try {
     const u = new URL(url);
-    return u.search ? `${u.origin}${u.pathname}?<signed>` : `${u.origin}${u.pathname}`;
+    if (!u.search) return `${u.origin}${u.pathname}`;
+    const parts = [];
+    let anySafe = false;
+    for (const [k, v] of u.searchParams) {
+      const safe = SAFE_QUERY_PARAMS.has(k);
+      if (safe) anySafe = true;
+      parts.push(`${k}=${safe ? v : "<redacted>"}`);
+    }
+    if (!anySafe) return `${u.origin}${u.pathname}?<signed>`;
+    return `${u.origin}${u.pathname}?${parts.join("&")}`;
   } catch {
     return "<url>";
   }
@@ -2263,21 +2282,33 @@ function interpretAnswer(raw, count, allLabel = "all") {
   if (LOOKS_NUMERIC.test(lower)) return { kind: "out-of-range" };
   return { kind: "text", text: trimmed };
 }
+function interpretAnswerWithAllEntry(raw, count, allLabel = "all") {
+  const reading = interpretAnswer(raw, count + 1, allLabel);
+  if (reading.kind !== "indexes") return reading;
+  if (reading.indexes.includes(1)) return { kind: "all" };
+  return { kind: "indexes", indexes: reading.indexes.map((i) => i - 1) };
+}
 async function chooseManyOrText(title, choices, opts) {
   if (choices.length === 0) return { kind: "values", values: [] };
   requireInteractive(title, "--help for the non-interactive flags");
   const allLabel = opts.allLabel ?? "all";
+  const allEntry = opts.allEntry;
+  const rows = allEntry ? [{ value: null, label: allEntry.label, hint: allEntry.hint }, ...choices] : choices;
   for (let attempt = 0; ; attempt++) {
     if (attempt >= 25) throw new Error(`no valid selection for: ${title}`);
     stderr.write(`
 ${c.cyan(">")} ${title}
 `);
-    renderChoices(choices);
-    stderr.write(c.dim(`  or "${allLabel}" for everything, or ${opts.textHint}
-`));
+    renderChoices(rows);
+    stderr.write(
+      c.dim(
+        allEntry ? `  or ${opts.textHint}
+` : `  or "${allLabel}" for everything, or ${opts.textHint}
+`
+      )
+    );
     const raw = (await ask(`numbers (e.g. 1,3 or 2-6), "${allLabel}", or name(s)`, opts.defaultAll ? allLabel : void 0)).trim();
-    const answer = raw.toLowerCase();
-    const reading = interpretAnswer(raw, choices.length, allLabel);
+    const reading = allEntry ? interpretAnswerWithAllEntry(raw, choices.length, allLabel) : interpretAnswer(raw, choices.length, allLabel);
     switch (reading.kind) {
       case "all":
         return { kind: "values", values: choices.map((ch) => ch.value) };
@@ -2286,7 +2317,7 @@ ${c.cyan(">")} ${title}
       case "text":
         return { kind: "text", text: reading.text };
       case "out-of-range":
-        stderr.write(c.yellow(`  no such entry -- the list has ${choices.length} items
+        stderr.write(c.yellow(`  no such entry -- the list has ${rows.length} items
 `));
         continue;
       default:
@@ -2447,13 +2478,25 @@ async function selectScope(conn, opts) {
   let targetNames;
   let projectNames;
   if (orgForNarrowing && isInteractive()) {
-    const targets = await tryList("targets", () => listTargets(client, orgForNarrowing.id)) ?? [];
+    const targets = await tryList(
+      "targets",
+      () => listTargets(client, orgForNarrowing.id),
+      `every target in ${orgForNarrowing.name} (no target filter)`
+    ) ?? [];
     if (targets.length > 1) {
       for (; ; ) {
         const answer = await chooseManyOrText(
           `Which targets in ${orgForNarrowing.name}?`,
           targets.map((t) => ({ value: t.name, label: t.name, hint: t.hint })),
-          { allLabel: "all", defaultAll: true, textHint: "type target name(s), comma separated" }
+          {
+            allLabel: "all",
+            defaultAll: true,
+            textHint: "type target name(s), comma separated",
+            allEntry: {
+              label: c.bold(`Everything in ${orgForNarrowing.name}`),
+              hint: `${targets.length} targets, one export`
+            }
+          }
         );
         if (answer.kind === "text") {
           let resolved;
