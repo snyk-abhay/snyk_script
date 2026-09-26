@@ -47,6 +47,9 @@ Snyk coverage mode (--snyk, needs SNYK_TOKEN):
 """
 
 import argparse
+import concurrent.futures
+import http.client
+import threading
 import json
 import os
 import sys
@@ -64,9 +67,48 @@ SCM = "Github"          # "Github Enterprise" for the github-enterprise command
 ERR_OUT = sys.stdout     # upstream prints failures to stdout; --snyk --json redirects to stderr
 
 
+# Status logging: timestamped lines on stderr (stdout keeps the upstream report clean).
+#   default   -> INFO: every step + one line per repo
+#   --quiet   -> WARN/ERROR + progress every 25 repos
+#   DEBUG=snyk* -> also every API page
+#   --logFile -> everything (incl. DEBUG) written to a file with full timestamps
+LEVELS = {"DEBUG": 10, "INFO": 20, "PROG": 30, "WARN": 30, "ERROR": 40}
+CONSOLE_LEVEL = 10 if DEBUG else 20
+LOG_FH = None
+_log_lock = threading.Lock()
+STATS = {"api_calls": 0, "rate_limit_waits": 0, "failed_repos": [], "start": time.time()}
+ERR_COLOR = sys.stderr.isatty()
+
+
+def log(level, msg):
+    lv = LEVELS[level]
+    now = datetime.now()
+    with _log_lock:
+        if lv >= CONSOLE_LEVEL:
+            tag = {"DEBUG": "DEBUG", "INFO": "INFO ", "PROG": "PROG ", "WARN": "WARN ", "ERROR": "ERROR"}[level]
+            if ERR_COLOR:
+                tag = {"DEBUG": "\033[90m", "INFO": "\033[36m", "PROG": "\033[32m", "WARN": "\033[33m", "ERROR": "\033[31m"}[level] \
+                      + tag + "\033[0m"
+            print(f"[{now:%H:%M:%S}] {tag} {msg}", file=sys.stderr, flush=True)
+        if LOG_FH:
+            LOG_FH.write(f"{now:%Y-%m-%d %H:%M:%S.%f}"[:-3] + f" {level:<5} {msg}\n")
+            LOG_FH.flush()
+
+
 def debug(msg):
-    if DEBUG:
-        print(f"  snyk:github-count {msg}", file=sys.stderr)
+    log("DEBUG", msg)
+
+
+def info(msg):
+    log("INFO", msg)
+
+
+def warn(msg):
+    log("WARN", msg)
+
+
+def error(msg):
+    log("ERROR", msg)
 
 
 def color(text, code):
@@ -88,41 +130,99 @@ class Spinner:
         self.quiet = quiet
 
     def succeed(self, text):
-        if not self.quiet:
-            print(f"{color('✔', '32')} {text}", file=sys.stderr)
+        info(f"✔ {text}")
 
 
 # ----------------------------------------------------------------------------- HTTP (fetchAllPages)
 
-MIN_TIME = 0.8          # Bottleneck minTime: 800 ms between requests
+# Speed: upstream waits 800 ms before EVERY call and runs one request at a time.
+# Here: no fixed delay by default (--throttle 0.8 restores upstream pacing), keep-alive
+# connections per thread, parallel repos (--workers), and rate-limit-aware back-off.
+MIN_TIME = 0.0
 _last_call = [0.0]
+_throttle_lock = threading.Lock()
+_local = threading.local()
 
 
-def _raw_get(url, token):
-    wait = MIN_TIME - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    req = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + token,
-        "User-Agent": "snyk-scm-contributors-count-py",
-    })
-    attempt = 0
-    while True:
+def _throttle():
+    if MIN_TIME <= 0:
+        return
+    with _throttle_lock:
+        wait = MIN_TIME - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
+
+
+def _conn(scheme, netloc):
+    pool = getattr(_local, "pool", None)
+    if pool is None:
+        pool = _local.pool = {}
+    key = (scheme, netloc)
+    if key not in pool:
+        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        pool[key] = cls(netloc, timeout=60)
+    return pool[key]
+
+
+def _drop_conn(scheme, netloc):
+    pool = getattr(_local, "pool", {})
+    c = pool.pop((scheme, netloc), None)
+    if c:
         try:
-            _last_call[0] = time.time()
-            resp = urllib.request.urlopen(req, timeout=60)
-            return resp.status, resp.headers, resp.read()
-        except urllib.error.HTTPError as e:
-            _last_call[0] = time.time()
-            return e.code, e.headers, e.read()
-        except urllib.error.URLError as e:
-            # Bottleneck "failed" handler: retry once after 25 ms
-            if attempt == 0:
-                print(f"Job failed: {e}\nRetrying job in 25ms!", file=sys.stderr)
-                attempt += 1
-                time.sleep(0.025)
-                continue
-            raise
+            c.close()
+        except Exception:
+            pass
+
+
+def _once(url, token, method="GET", body=None, extra_headers=None):
+    u = urllib.parse.urlsplit(url)
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    headers = {"Authorization": "Bearer " + token, "User-Agent": "snyk-scm-contributors-count-py",
+               "Accept": "application/vnd.github+json"}
+    headers.update(extra_headers or {})
+    for attempt in range(3):                 # reconnect on stale keep-alive / network blips
+        _throttle()
+        c = _conn(u.scheme, u.netloc)
+        with _log_lock:
+            STATS["api_calls"] += 1
+        try:
+            c.request(method, path, body=body, headers=headers)
+            r = c.getresponse()
+            data = r.read()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, data
+        except (http.client.HTTPException, OSError) as e:
+            _drop_conn(u.scheme, u.netloc)
+            if attempt == 2:
+                raise urllib.error.URLError(e)
+            debug(f"Connection issue ({e}), retrying")
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _rate_limit_wait(status, headers):
+    """Seconds to wait if this is a primary/secondary rate limit response, else None."""
+    if status not in (403, 429):
+        return None
+    if headers.get("retry-after"):
+        return int(headers["retry-after"]) + 1
+    if headers.get("x-ratelimit-remaining") == "0" and headers.get("x-ratelimit-reset"):
+        return max(int(headers["x-ratelimit-reset"]) - int(time.time()), 0) + 2
+    if status == 429:
+        return 180                          # upstream default
+    return None
+
+
+def _raw_get(url, token, method="GET", body=None, extra_headers=None):
+    for _ in range(6):
+        status, headers, data = _once(url, token, method, body, extra_headers)
+        wait = _rate_limit_wait(status, headers)
+        if wait is None:
+            return status, headers, data
+        STATS["rate_limit_waits"] += 1
+        warn(f"GitHub rate limit hit (HTTP {status}) - pausing {wait}s, will resume automatically "
+             f"(tip: lower --workers if this repeats)")
+        time.sleep(min(wait, 3700))
+    return status, headers, data
 
 
 def fetch_all_pages(url, token, item_name=""):
@@ -131,14 +231,9 @@ def fetch_all_pages(url, token, item_name=""):
     while True:
         debug(f"Fetching page {page} for {item_name}")
         status, headers, body = _raw_get(url, token)
+        debug(f"GET {urllib.parse.urlsplit(url).path} page {page} -> HTTP {status}")
         if status >= 400:
-            if status == 429:
-                debug(f"Failed to fetch page: {url}, Response Status: 429 Too many requests. "
-                      f"Waiting for 3 minutes before resuming")
-                time.sleep(180)
-                debug(f"Retrying to fetch page: {url}")
-                status, headers, body = _raw_get(url, token)
-            elif status == 409:
+            if status == 409:
                 return []
             else:
                 debug(f"Failed to fetch page: {url}, Response Status: {status}")
@@ -167,6 +262,7 @@ def fetch_all_pages(url, token, item_name=""):
 # ----------------------------------------------------------------------------- GitHub logic
 
 def fetch_orgs(url, token, label):
+    info("Discovering GitHub organizations visible to the token...")
     org_list = []
     try:
         for org in fetch_all_pages(url, token, label):
@@ -181,7 +277,9 @@ def fetch_orgs(url, token, label):
 def fetch_repos_for_orgs(api, token, orgs):
     repo_list = []
     try:
-        for org in orgs:
+        for oi, org in enumerate(orgs, 1):
+            info(f"[org {oi}/{len(orgs)}] Listing repositories in '{org}'...")
+            before_count = len(repo_list)
             repos = fetch_all_pages(f"{api}orgs/{org}/repos?per_page=100&sort=full_name", token, org)
             if not any(isinstance(r, dict) and r.get("name") for r in repos):
                 # Not an org (404) -> maybe a USER account. Extension beyond upstream (which returns 0 here).
@@ -196,8 +294,7 @@ def fetch_repos_for_orgs(api, token, orgs):
                         f"{api}users/{org}/repos?per_page=100&type=owner&sort=full_name", token, org)
                 if any(isinstance(r, dict) and r.get("name") for r in user_repos):
                     debug(f"'{org}' is a user account, not an org - counting its own repos")
-                    print(f"Note: '{org}' is a GitHub user account, not an organization - "
-                          f"counting repos owned by that user", file=sys.stderr)
+                    info(f"'{org}' is a GitHub user account, not an organization - counting repos owned by that user")
                     repos = user_repos
             for r in repos:
                 if not isinstance(r, dict):
@@ -206,7 +303,18 @@ def fetch_repos_for_orgs(api, token, orgs):
                 if name and owner:
                     repo_list.append({"name": name, "owner": owner, "private": r.get("private"),
                                       "default_branch": r.get("default_branch"),
-                                      "archived": r.get("archived")})
+                                      "archived": r.get("archived"),
+                                      "pushed_at": r.get("pushed_at")})
+            got = repo_list[before_count:]
+            if got:
+                info(f"[org {oi}/{len(orgs)}] '{org}': {len(got)} repos "
+                     f"(private {sum(1 for x in got if x.get('private'))}, "
+                     f"public {sum(1 for x in got if not x.get('private'))}, "
+                     f"archived {sum(1 for x in got if x.get('archived'))})")
+            else:
+                msg = next((x.get("message") for x in repos if isinstance(x, dict) and x.get("message")), "")
+                warn(f"[org {oi}/{len(orgs)}] '{org}': 0 repos visible{f' ({msg})' if msg else ''} - "
+                     f"check 'repo' scope, SSO authorization and org membership")
     except Exception as err:
         debug(f"Failed to retrieve repo list from {SCM}.\n{err}")
         print(f"Failed to retrieve repo list from {SCM}. Try running with `DEBUG=snyk* snyk-contributor`", file=ERR_OUT)
@@ -230,23 +338,49 @@ BRANCH_MODE = "default"
 
 def _graphql(api, token, query, variables):
     url = api.replace("/api/v3/", "/api/graphql") if api.endswith("/api/v3/") else api + "graphql"
-    wait = MIN_TIME - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    req = urllib.request.Request(url, data=json.dumps({"query": query, "variables": variables}).encode(),
-                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                                          "User-Agent": "snyk-scm-contributors-count-py"})
     try:
-        _last_call[0] = time.time()
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode() or "{}")
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as err:
+        status, _, data = _raw_get(url, token, "POST", json.dumps({"query": query, "variables": variables}),
+                                   {"Content-Type": "application/json"})
+        body = json.loads(data.decode() or "{}")
+    except (urllib.error.URLError, ValueError) as err:
         debug(f"GraphQL failed: {err}")
         return None
-    if body.get("errors"):
+    if status >= 400 or not isinstance(body, dict):
+        debug(f"GraphQL HTTP {status}")
+        return None
+    if body.get("errors") and not body.get("data"):
         debug(f"GraphQL errors: {body['errors']}")
         return None
     return body.get("data")
+
+
+GQL_BATCH = 40
+
+
+def prefetch_latest_branches(api, token, repos):
+    """Batch GraphQL: latest-commit branch for up to GQL_BATCH repos per request.
+    Sets repo['_latest'] = branch name ('' when repo has no branches). Repos that fail stay unset
+    and fall back to the per-repo lookup."""
+    frag = ('{alias}: repository(owner:{o}, name:{n}){{ defaultBranchRef{{ name }} '
+            'refs(refPrefix:"refs/heads/", first:1, orderBy:{{field:TAG_COMMIT_DATE, direction:DESC}})'
+            '{{ nodes{{ name }} }} }}')
+    batches = [repos[i:i + GQL_BATCH] for i in range(0, len(repos), GQL_BATCH)]
+
+    def run(batch):
+        parts = [frag.format(alias=f"r{i}", o=json.dumps(r["owner"]), n=json.dumps(r["name"]))
+                 for i, r in enumerate(batch)]
+        data = _graphql(api, token, "query{ " + " ".join(parts) + " }", {}) or {}
+        for i, r in enumerate(batch):
+            node = data.get(f"r{i}")
+            if node is None:
+                continue
+            nodes = (node.get("refs") or {}).get("nodes") or []
+            r["_latest"] = nodes[0]["name"] if nodes else ""
+            if node.get("defaultBranchRef") and not r.get("default_branch"):
+                r["default_branch"] = node["defaultBranchRef"]["name"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, 4)) as ex:
+        list(ex.map(run, batches))
 
 
 LATEST_BRANCH_QUERY = """
@@ -282,6 +416,8 @@ def resolve_branch(api, token, repo):
             return BRANCH_MODE
         debug(f"Branch '{BRANCH_MODE}' not found in {repo['owner']}/{repo['name']}, using default branch")
         return None
+    if "_latest" in repo:
+        return repo["_latest"] or None
     data = _graphql(api, token, LATEST_BRANCH_QUERY, {"o": repo["owner"], "n": repo["name"]})
     repo_data = (data or {}).get("repository")
     if repo_data is not None:
@@ -311,11 +447,15 @@ def fetch_commits_for_repo(api, token, repo, since):
         for i, c in enumerate(commits):
             if not (isinstance(c, dict) and isinstance(c.get("commit"), dict)
                     and isinstance(c["commit"].get("author"), dict)):
-                bad = f"invalid commit payload: {str(c)[:200]}"
+                bad = (c.get("message") if isinstance(c, dict) and c.get("message") else f"invalid payload: {str(c)[:120]}")
                 commits = commits[:i]
                 break
     if bad is not None:
-        debug(f"Failed to retrieve commits from {SCM}.\n{bad}")
+        hint = " (token not SSO-authorized for this org)" if "SAML" in str(bad) else ""
+        repo["_error"] = f"{bad}{hint}"
+        with _log_lock:
+            STATS["failed_repos"].append((f"{repo['owner']}/{repo['name']}", repo["_error"]))
+        warn(f"{repo['owner']}/{repo['name']}: failed to read commits - {repo['_error']}")
         print(f"Failed to retrieve commits from {SCM}. Try running with `DEBUG=snyk* snyk-contributor`", file=ERR_OUT)
     return commits
 
@@ -371,6 +511,68 @@ def repo_key(r):
     return f"{r['owner']}/{r['name']}".lower()
 
 
+WORKERS = 10
+VERBOSE_REPOS = True
+SKIP_INACTIVE = True
+SHOW_PROGRESS = True
+
+
+def fetch_commits_parallel(api, token, repo_list, since, commits_cache):
+    """Fetch commits for many repos concurrently. Results go into commits_cache keyed by repo,
+    so the (order-sensitive) contributor aggregation afterwards still runs in repo order."""
+    active, skipped = [], 0
+    for r in repo_list:
+        # No push since the window start -> no commits dated inside the window on any branch.
+        if SKIP_INACTIVE and r.get("pushed_at") and r["pushed_at"] < since:
+            commits_cache[repo_key(r)] = []
+            r["scanned_branch"] = r.get("default_branch") or "(default)"
+            skipped += 1
+        else:
+            active.append(r)
+    info(f"Repositories in scope: {len(repo_list)} | pushed in last 90 days: {len(active)} | "
+         f"inactive (skipped, no commits possible): {skipped}")
+    for r in repo_list:
+        if r not in active:
+            debug(f"SKIP {r['owner']}/{r['name']} - last push {r.get('pushed_at')}")
+
+    if BRANCH_MODE == "latest" and active:
+        t = time.time()
+        info(f"Resolving the latest-commit branch for {len(active)} repos "
+             f"({(len(active) + GQL_BATCH - 1) // GQL_BATCH} batched GraphQL request(s))...")
+        prefetch_latest_branches(api, token, active)
+        info(f"Latest branches resolved in {time.time() - t:.1f}s")
+
+    if active:
+        info(f"Fetching commits since {since} for {len(active)} repos using {WORKERS} parallel workers...")
+
+    done, total, t0 = 0, len(active), time.time()
+    lock = threading.Lock()
+
+    def work(r):
+        t = time.time()
+        return r, fetch_commits_for_repo(api, token, r, since), time.time() - t
+
+    width = len(str(total))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = [ex.submit(work, r) for r in active]
+        for fut in concurrent.futures.as_completed(futures):
+            r, commits, took = fut.result()
+            commits_cache[repo_key(r)] = commits
+            with lock:
+                done += 1
+                n = done
+            el = time.time() - t0
+            eta = el / n * (total - n)
+            if VERBOSE_REPOS:
+                status = "FAILED" if r.get("_error") else "ok"
+                devs = len(per_repo_contributors(commits))
+                info(f"[{n:>{width}}/{total}] {r['owner']}/{r['name']:<40} branch={r.get('scanned_branch')}  "
+                     f"commits={len(commits):<4} contributors={devs:<3} {took:.1f}s  {status}")
+            if n % 25 == 0 or n == total:
+                log("PROG", f"Progress: {n}/{total} repos ({100 * n // total}%) | {el:.0f}s elapsed | "
+                     f"~{eta:.0f}s remaining | API calls so far: {STATS['api_calls']}")
+
+
 def fetch_github_repos_and_commits(api, token, orgs, repo, since, fetch_all_orgs=False):
     """Returns (repo_list, commits_cache). Same repo discovery as upstream fetchGithubContributors."""
     repo_list, commits_cache = [], {}
@@ -384,7 +586,10 @@ def fetch_github_repos_and_commits(api, token, orgs, repo, since, fetch_all_orgs
         elif not orgs:
             url = f"{api}organizations?per_page=100" if fetch_all_orgs else f"{api}user/orgs?per_page=100"
             orgs = fetch_orgs(url, token, "Orgs")
+            if orgs:
+                info(f"Found {len(orgs)} organization(s): {', '.join(orgs[:15])}{' ...' if len(orgs) > 15 else ''}")
             if len(orgs) < 1:
+                warn("Token sees 0 organizations - check 'read:org' scope and SSO authorization")
                 print("Did not find any Orgs related to the user, please try to append one/few org/s "
                       "to the command with the orgs flag and try again")
             debug(f"Found {len(orgs)} Orgs")
@@ -392,9 +597,7 @@ def fetch_github_repos_and_commits(api, token, orgs, repo, since, fetch_all_orgs
         else:
             repo_list += fetch_repos_for_orgs(api, token, orgs)
         debug(f"Found {len(repo_list)} Repos")
-        for i, r in enumerate(repo_list, 1):
-            debug(f"[{i}/{len(repo_list)}] {r['owner']}/{r['name']}")
-            commits_cache[repo_key(r)] = fetch_commits_for_repo(api, token, r, since)
+        fetch_commits_parallel(api, token, repo_list, since, commits_cache)
     except SystemExit:
         raise
     except Exception as err:
@@ -437,6 +640,12 @@ def snyk_get_all(base, token, path):
                                      "Check SNYK_TOKEN (Account settings > Auth Token / service account) "
                                      "and --snykApiUrl for your region.")
                 raise RuntimeError(f"Snyk API {e.code} for {url}: {msg}")
+            except (urllib.error.URLError, OSError) as e:
+                if attempt < 2:
+                    warn(f"Snyk: connection problem ({getattr(e, 'reason', e)}), retrying...")
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"cannot reach {url}: {getattr(e, 'reason', e)}")
         items.extend(body.get("data") or [])
         nxt = (body.get("links") or {}).get("next")
         if nxt:
@@ -481,17 +690,26 @@ def _repo_from_url(url):
 def snyk_monitored_repos(base, token, scm_host, in_scope_keys, group_id=None, org_ids=None, quiet=False):
     """Returns {repo_key: set(snyk org names)} for in-scope GitHub repos that have a Snyk target."""
     matches = {}
-    orgs = snyk_orgs(base, token, group_id, org_ids)
-    if not quiet:
-        print(f"Found {len(orgs)} Snyk org(s) visible to SNYK_TOKEN", file=sys.stderr)
-    for i, org in enumerate(orgs, 1):
-        debug(f"[{i}/{len(orgs)}] Snyk org {org['name']} ({org['id']})")
+    info(f"Snyk: listing organizations ({'group ' + group_id if group_id else 'org IDs given' if org_ids else 'all orgs visible to SNYK_TOKEN'}) via {base}...")
+    try:
+        orgs = snyk_orgs(base, token, group_id, org_ids)
+    except RuntimeError as err:
+        error(f"Snyk: could not list organizations - {err}")
+        error("Check --snykApiUrl (region), --snykGroupId, and that SNYK_TOKEN has access")
+        raise SystemExit(1)
+    info(f"Snyk: found {len(orgs)} organization(s): {', '.join(o['name'] for o in orgs[:10])}{' ...' if len(orgs) > 10 else ''}")
+    def load(org):
+        debug(f"Snyk org {org['name']} ({org['id']})")
         try:
-            targets = snyk_get_all(base, token, f"/orgs/{org['id']}/targets?version={SNYK_API_VERSION}&limit=100")
+            return org, snyk_get_all(base, token, f"/orgs/{org['id']}/targets?version={SNYK_API_VERSION}&limit=100")
         except RuntimeError as err:
-            debug(str(err))
-            print(f"Failed retrieving Snyk targets for org {org['name']}", file=sys.stderr)
-            continue
+            warn(f"Snyk: failed to list targets for org '{org['name']}' - {err}")
+            return org, []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, 8)) as ex:
+        results = list(ex.map(load, orgs))
+    for org, targets in results:
+        before_match = len(matches)
         for t in targets:
             a = t.get("attributes") or {}
             display = (a.get("display_name") or a.get("displayName") or "").strip().lower()
@@ -504,6 +722,8 @@ def snyk_monitored_repos(base, token, scm_host, in_scope_keys, group_id=None, or
                 key = display                       # SCM integration target "owner/repo"
             if key:
                 matches.setdefault(key, set()).add(org["name"])
+        info(f"Snyk: org '{org['name']}': {len(targets)} targets, {len(matches) - before_match} new GitHub repo match(es)")
+    info(f"Snyk: {len(matches)} of {len(in_scope_keys)} GitHub repos in scope are monitored in Snyk")
     return matches
 
 
@@ -803,6 +1023,15 @@ def main():
         sp.add_argument("--repo", help="[Optional] A single repo to count contributors for (needs one --orgs)")
         sp.add_argument("--exclusionFilePath", help="[Optional] Exclusion list filepath (one email per line)")
         sp.add_argument("--json", action="store_true", help="[Optional] JSON output")
+        sp.add_argument("--workers", type=int, default=10,
+                        help="[Speed] Parallel repos (default 10; lower it if you hit secondary rate limits)")
+        sp.add_argument("--throttle", type=float, default=0.0,
+                        help="[Speed] Seconds between API calls (default 0; 0.8 = upstream pacing)")
+        sp.add_argument("--noSkipInactive", action="store_true",
+                        help="[Speed] Don't skip repos with no push in the last 90 days")
+        sp.add_argument("--quiet", action="store_true",
+                        help="[Logging] Only warnings/errors + progress every 25 repos (no per-repo lines)")
+        sp.add_argument("--logFile", help="[Logging] Also write a detailed timestamped log (incl. debug) to this file")
         sp.add_argument("--branch", default="default",
                         help="[Optional] 'default' (repo default branch, same as Snyk - DEFAULT), "
                              "'latest' (branch with the most recent commit), or a branch name")
@@ -839,10 +1068,17 @@ def main():
         scm_host = args.url.split("://", 1)[-1].split("/")[0].split(":")[0].lower()
         fetch_all = args.fetchAllOrgs
 
-    global BRANCH_MODE
+    global BRANCH_MODE, WORKERS, MIN_TIME, SKIP_INACTIVE, SHOW_PROGRESS, VERBOSE_REPOS, CONSOLE_LEVEL, LOG_FH
     BRANCH_MODE = args.branch
-    if BRANCH_MODE != "default" and not quiet_mode(args):
-        print(f"Branch mode: {BRANCH_MODE} (note: Snyk licensing counts the DEFAULT branch only)", file=sys.stderr)
+    WORKERS = max(1, args.workers)
+    MIN_TIME = max(0.0, args.throttle)
+    SKIP_INACTIVE = not args.noSkipInactive
+    SHOW_PROGRESS = True
+    VERBOSE_REPOS = not args.quiet
+    if args.quiet and not DEBUG:
+        CONSOLE_LEVEL = LEVELS["WARN"]
+    if args.logFile:
+        LOG_FH = open(args.logFile, "a", encoding="utf-8")
 
     snyk_token = os.environ.get("SNYK_TOKEN")
     if args.snyk and args.json:
@@ -852,38 +1088,108 @@ def main():
         p.error("--snyk needs SNYK_TOKEN exported:  export SNYK_TOKEN=<snyk api token>")
 
     orgs = args.orgs.split(",") if args.orgs else None
-    quiet = DEBUG or args.json
-    spinner = Spinner(quiet)
-    debug(f"Options: Orgs: {orgs}, Repo: {args.repo}, Exclusion File: {args.exclusionFilePath}")
+    since = three_months_date()
+    spinner = Spinner(False)
 
-    repo_list, commits_cache = fetch_github_repos_and_commits(
-        api, args.token, orgs, args.repo, three_months_date(), fetch_all)
-    contributors = build_contributor_map(repo_list, commits_cache)
-    spinner.succeed("Retrieving projects/orgs from the SCM with commits in last 90 days")
-
-    if args.snyk:
-        monitored = snyk_monitored_repos(
-            args.snykApiUrl.rstrip("/"), snyk_token, scm_host, {repo_key(r) for r in repo_list},
-            args.snykGroupId, args.snykOrgIds.split(",") if args.snykOrgIds else None, quiet)
-        spinner.succeed("Loading snyk monitored repos list")
-        report = snyk_coverage_report(repo_list, commits_cache, monitored, args.exclusionFilePath,
-                                      args.json, args.outputDir)
-        if args.json:
-            print(json.dumps({"snykCoverage": report}, indent=4))
-            return
-        print(f"\n{yellow('#### GitHub contributors (upstream snyk-scm-contributors-count output)')}")
-
-    contributors = dedup_contributors_by_email(contributors)
-    before = len(contributors)
-    spinner.succeed("Removing duplicate contributors")
-
+    info("=" * 78)
+    info(f"Contributor count run started - {SCM} ({api})")
+    info(f"Scope      : {'org ' + orgs[0] + ' / repo ' + args.repo if args.repo else ('orgs: ' + ', '.join(orgs)) if orgs else ('ALL orgs on the server' if fetch_all else 'all orgs the token user belongs to')}")
+    info(f"Window     : last 90 days (commits since {since})")
+    info(f"Branch     : {BRANCH_MODE}{'  (note: Snyk licensing counts the DEFAULT branch only)' if BRANCH_MODE != 'default' else ' (repo default branch - same as Snyk)'}")
+    info(f"Speed      : workers={WORKERS} throttle={MIN_TIME}s skip-inactive={SKIP_INACTIVE}")
+    info(f"Snyk check : {'ON (' + args.snykApiUrl + ')' if args.snyk else 'off (add --snyk to compare with Snyk)'}")
     if args.exclusionFilePath:
-        contributors = exclude_from_list_by_email(contributors, args.exclusionFilePath)
-        spinner.succeed("Applying exclusion list ")
+        info(f"Exclusions : {args.exclusionFilePath}")
+    if args.logFile:
+        info(f"Log file   : {os.path.abspath(args.logFile)}")
+    info("=" * 78)
 
-    printout_results(calculate_summary_stats(contributors, before - len(contributors)), args.json)
-    if BRANCH_MODE != "default" and not args.json:
-        print_branch_summary(repo_list)
+    preflight_github(api, args.token)
+    try:
+        info("STEP 1/4  Discovering repositories and fetching commits from GitHub")
+        repo_list, commits_cache = fetch_github_repos_and_commits(api, args.token, orgs, args.repo, since, fetch_all)
+        contributors = build_contributor_map(repo_list, commits_cache)
+        spinner.succeed("Retrieving projects/orgs from the SCM with commits in last 90 days")
+
+        if args.snyk:
+            info("STEP 2/4  Checking which repositories are monitored in Snyk")
+            monitored = snyk_monitored_repos(
+                args.snykApiUrl.rstrip("/"), snyk_token, scm_host, {repo_key(r) for r in repo_list},
+                args.snykGroupId, args.snykOrgIds.split(",") if args.snykOrgIds else None, False)
+            spinner.succeed("Loading snyk monitored repos list")
+            info("STEP 3/4  Building Snyk coverage report")
+            report = snyk_coverage_report(repo_list, commits_cache, monitored, args.exclusionFilePath,
+                                          args.json, args.outputDir)
+            if args.json:
+                print(json.dumps({"snykCoverage": report}, indent=4))
+                return
+            print(f"\n{yellow('#### GitHub contributors (upstream snyk-scm-contributors-count output)')}")
+        else:
+            info("STEP 2/4  Snyk check skipped (no --snyk)")
+            info("STEP 3/4  -")
+
+        info("STEP 4/4  De-duplicating contributors by email and printing results")
+        contributors = dedup_contributors_by_email(contributors)
+        before = len(contributors)
+        spinner.succeed(f"Removing duplicate contributors ({before} unique)")
+
+        if args.exclusionFilePath:
+            contributors = exclude_from_list_by_email(contributors, args.exclusionFilePath)
+            spinner.succeed(f"Applying exclusion list ({before - len(contributors)} excluded)")
+
+        printout_results(calculate_summary_stats(contributors, before - len(contributors)), args.json)
+        if BRANCH_MODE != "default" and not args.json:
+            print_branch_summary(repo_list)
+    except KeyboardInterrupt:
+        error("Interrupted by user (Ctrl+C)")
+        raise SystemExit(130)
+    finally:
+        run_summary()
+
+
+def preflight_github(api, token):
+    """Who am I, which scopes, how much rate limit is left."""
+    try:
+        status, headers, body = _raw_get(f"{api}user", token)
+        me = json.loads(body.decode() or "{}") if body else {}
+        if status == 401:
+            error("GitHub token rejected (401 Bad credentials) - create a new token")
+            raise SystemExit(1)
+        scopes = headers.get("x-oauth-scopes")
+        info(f"GitHub auth: logged in as '{me.get('login', '?')}'"
+             + (f" | token scopes: {scopes or '(none)'}" if scopes is not None else " | fine-grained / app token"))
+        if scopes is not None:
+            have = {x.strip() for x in scopes.split(",")}
+            if "repo" not in have:
+                warn("Token is missing the 'repo' scope - private repos will be invisible")
+            if not ({"read:org", "admin:org", "write:org"} & have):
+                warn("Token is missing 'read:org' - org discovery may return 0 orgs")
+        status, _, body = _raw_get(f"{api}rate_limit", token)
+        if status == 200:
+            core = (json.loads(body.decode()).get("resources") or {}).get("core") or {}
+            reset = datetime.fromtimestamp(core.get("reset", 0)).strftime("%H:%M:%S")
+            info(f"GitHub rate limit: {core.get('remaining')}/{core.get('limit')} calls left (resets {reset})")
+    except SystemExit:
+        raise
+    except Exception as err:
+        warn(f"Pre-flight check failed ({err}) - continuing")
+
+
+def run_summary():
+    el = time.time() - STATS["start"]
+    info("=" * 78)
+    info(f"Run finished in {int(el // 60)}m {el % 60:.0f}s | API calls: {STATS['api_calls']} | "
+         f"rate-limit pauses: {STATS['rate_limit_waits']} | failed repos: {len(STATS['failed_repos'])}")
+    for name, why in STATS["failed_repos"][:50]:
+        warn(f"  not counted: {name} - {why}")
+    if len(STATS["failed_repos"]) > 50:
+        warn(f"  ... and {len(STATS['failed_repos']) - 50} more (see --logFile)")
+        for name, why in STATS["failed_repos"][50:]:
+            if LOG_FH:
+                LOG_FH.write(f"not counted: {name} - {why}\n")
+    info("=" * 78)
+    if LOG_FH:
+        LOG_FH.close()
 
 
 if __name__ == "__main__":
