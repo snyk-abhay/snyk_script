@@ -1197,7 +1197,13 @@ var SAFE_QUERY_PARAMS = /* @__PURE__ */ new Set([
   "starting_after",
   "ending_before",
   "cursor",
-  "url"
+  "url",
+  "expand",
+  "meta.latest_issue_counts",
+  "created_after",
+  "include_code_flows",
+  "scan_item.id",
+  "scan_item.type"
 ]);
 function redactUrl(url) {
   try {
@@ -1647,6 +1653,293 @@ function describeSince(preset) {
   return SINCE_CHOICES.find((c2) => c2.value === preset)?.label ?? preset;
 }
 
+// snyk_report/lib/normalize/rest-issue.mts
+var OBSERVABLE_FIELDS = ["score", "riskFactors", "reachability", "dataflow"];
+var CONTAINER_PROJECT_TYPES = /* @__PURE__ */ new Set(["apk", "deb", "rpm", "linux", "dockerfile"]);
+var CONTAINER_ORIGINS = /* @__PURE__ */ new Set(["docker-hub", "ecr", "acr", "gcr", "kubernetes"]);
+function isContainerProject(p) {
+  if (!p) return false;
+  if (p.type && CONTAINER_PROJECT_TYPES.has(p.type.toLowerCase())) return true;
+  const origin = (p.origin ?? "").toLowerCase();
+  return CONTAINER_ORIGINS.has(origin) || origin.endsWith("-cr");
+}
+function restProduct(type, project) {
+  switch (type) {
+    case "package_vulnerability":
+    case "license":
+      return isContainerProject(project) ? "container" : "open-source";
+    case "code":
+      return "code";
+    case "config":
+    case "cloud":
+      return "iac";
+    case "secrets":
+      return "secrets";
+    case "custom":
+      return "custom";
+    default:
+      return "unknown";
+  }
+}
+var TYPE_LABEL = {
+  package_vulnerability: "Vulnerability",
+  license: "License",
+  code: "Code",
+  config: "Configuration",
+  cloud: "Cloud",
+  custom: "Custom",
+  secrets: "Secret"
+};
+function restStatus(status, ignored) {
+  if (status === "resolved") return "resolved";
+  if (ignored) return "ignored";
+  return "open";
+}
+var REACHABILITY = {
+  function: "reachable",
+  package: "reachable",
+  "no-info": "no-path-found",
+  "not-applicable": "not-applicable"
+};
+var REACH_RANK = ["reachable", "no-path-found", "not-applicable"];
+function uniq(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+function strings(v) {
+  if (typeof v === "string") return [v];
+  return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+}
+function latest(values) {
+  let best = null;
+  for (const v of values) {
+    const t = parseSnykTimestamp(v);
+    if (t && (!best || t.ms > best.ms)) best = t;
+  }
+  return best;
+}
+function regionOf(r) {
+  const sl = r.start?.line ?? null;
+  const sc = r.start?.column ?? null;
+  const el = r.end?.line ?? null;
+  const ec = r.end?.column ?? null;
+  return {
+    raw: `${sl ?? ""}:${sc ?? ""}-${el ?? ""}:${ec ?? ""}`,
+    startLine: sl,
+    endLine: el,
+    startColumn: sc,
+    endColumn: ec
+  };
+}
+function projectRef(p) {
+  return {
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    origin: p.origin,
+    targetDisplayName: p.targetDisplayName,
+    targetRef: p.targetReference,
+    targetFile: p.targetFile,
+    criticality: p.criticality,
+    environment: p.environment,
+    lifecycle: p.lifecycle,
+    tags: p.tags
+  };
+}
+function normalizeRestIssue(raw, ctx) {
+  const a = raw.attributes ?? {};
+  const id = raw.id ?? "";
+  const severity = normalizeSeverity(a.effective_severity_level);
+  if (!severity) {
+    return a.effective_severity_level === "info" ? { ok: false, reason: "filtered", detail: `issue ${id}: info severity` } : {
+      ok: false,
+      reason: "unparseable",
+      detail: `issue ${id || "?"}: unrecognised severity ${JSON.stringify(a.effective_severity_level)}`
+    };
+  }
+  const problems = a.problems ?? [];
+  const snykVuln = problems.find((p) => p.type === "vulnerability" && /^snyk-/i.test(p.id ?? "")) ?? problems.find((p) => p.type === "vulnerability" && /snyk/i.test(p.source ?? ""));
+  const rule = problems.find((p) => p.type === "rule");
+  const problemId = (snykVuln ?? rule ?? problems.find((p) => p.id))?.id ?? "";
+  const title = (a.title ?? "").trim();
+  if (!id || !problemId && !title) {
+    return { ok: false, reason: "unparseable", detail: `issue ${id || "?"}: no id, problem id or title` };
+  }
+  const scanItem = raw.relationships?.scan_item?.data;
+  const product = restProduct(a.type, ctx.project);
+  const observed = /* @__PURE__ */ new Set();
+  const issue = {
+    source: "issues-rest",
+    // The issue resource id is Snyk-assigned and unique per issue, so the
+    // key is strong and duplicates across pages can be dropped safely.
+    issueKey: `rest:${id}`,
+    problemId: problemId || title,
+    title: title || problemId,
+    severity,
+    status: restStatus(a.status, a.ignored),
+    product,
+    org: ctx.org,
+    group: ctx.group,
+    project: ctx.project ? projectRef(ctx.project) : scanItem?.type === "project" && scanItem.id ? { id: scanItem.id } : null,
+    issueType: a.type ? TYPE_LABEL[a.type] ?? a.type : null
+  };
+  if (a.risk) {
+    observed.add("riskFactors");
+    const factors = (a.risk.factors ?? []).filter((f) => f.value === true && f.name).map((f) => f.name.replace(/_/g, " "));
+    issue.riskFactors = factors.length ? factors : null;
+  } else {
+    issue.riskFactors = null;
+  }
+  if (typeof a.risk?.score?.value === "number") {
+    observed.add("score");
+    issue.score = a.risk.score.value;
+  } else {
+    issue.score = null;
+  }
+  const entries = (a.severities ?? []).map((s) => ({
+    source: s.source ?? "unknown",
+    version: s.version ?? (s.vector ? parseCvssVector(s.vector).version ?? "" : ""),
+    score: typeof s.score === "number" && Number.isFinite(s.score) ? s.score : null,
+    vector: s.vector || null,
+    level: normalizeSeverity(s.level)
+  }));
+  const cvss = pickCvss(entries);
+  issue.cvss = cvss.primary;
+  issue.cvssV4 = cvss.v4;
+  issue.nvdScore = cvss.nvdScore;
+  issue.nvdSeverity = cvss.nvdSeverity;
+  const levels = a.exploit_details?.maturity_levels ?? [];
+  const em = normalizeExploitMaturity(
+    levels.find((l) => !/v4/i.test(l.format ?? ""))?.level,
+    levels.find((l) => /v4/i.test(l.format ?? ""))?.level
+  );
+  issue.exploitMaturity = em.value;
+  issue.exploitVocab = em.vocab;
+  const cve = uniq(problems.map((p) => p.id ?? "").filter((v) => /^CVE-\d{4}-\d+$/i.test(v)));
+  issue.cve = cve.length ? cve : null;
+  const cwe = uniq((a.classes ?? []).map((c2) => c2.id ?? "").filter((v) => /^CWE-\d+$/i.test(v)));
+  issue.cwe = cwe.length ? cwe : null;
+  issue.vulnDbUrl = snykVuln?.url ?? null;
+  issue.vulnerabilityPublicationDate = parseSnykTimestamp(snykVuln?.disclosed_at);
+  const coords = a.coordinates ?? [];
+  const reps = coords.flatMap((c2) => c2.representations ?? []);
+  const packages = uniq(
+    reps.map((r) => {
+      const d = r.dependency;
+      if (!d?.package_name) return "";
+      return d.package_version ? `${d.package_name}@${d.package_version}` : d.package_name;
+    })
+  );
+  issue.packageNameAndVersion = packages.length ? packages.join(", ") : null;
+  const loc = reps.find((r) => r.sourceLocation?.file)?.sourceLocation;
+  issue.filePath = loc?.file ?? null;
+  issue.codeRegion = loc?.region ? regionOf(loc.region) : null;
+  issue.commitId = loc?.commit_id || null;
+  const fixedIn = [];
+  const ranges = [];
+  for (const c2 of coords) {
+    for (const r of c2.remedies ?? []) {
+      if (!r.meta?.schema_version?.startsWith("package_vulnerability")) continue;
+      fixedIn.push(...strings(r.meta.data?.fixed_in));
+      ranges.push(...strings(r.meta.data?.semver_vulnerable));
+    }
+  }
+  issue.fixedInVersion = uniq(fixedIn).join(", ") || null;
+  issue.semverVulnerableRange = uniq(ranges).join(", ") || null;
+  const upstream = coords.map((c2) => c2.is_fixable_upstream).filter((v) => typeof v === "boolean");
+  issue.fixedInAvailable = fixedIn.length ? true : upstream.length ? upstream.some(Boolean) : null;
+  const reach = coords.map((c2) => c2.reachability).filter((r) => Boolean(r));
+  if (reach.length) observed.add("reachability");
+  const mapped = new Set(reach.map((r) => REACHABILITY[r]).filter((r) => Boolean(r)));
+  issue.reachability = REACH_RANK.find((r) => mapped.has(r)) ?? null;
+  issue.firstIntroduced = parseSnykTimestamp(a.created_at);
+  issue.updatedAt = parseSnykTimestamp(a.updated_at);
+  issue.lastIntroduced = latest(coords.map((c2) => c2.last_introduced_at));
+  issue.lastResolved = parseSnykTimestamp(a.resolution?.resolved_at) ?? latest(coords.map((c2) => c2.last_resolved_at));
+  let flowOmitted = false;
+  if (product === "code") {
+    flowOmitted = coords.some((c2) => c2.code_flows_omitted === true);
+    const withFlow = coords.find((c2) => c2.code_flows?.length);
+    if (withFlow || flowOmitted) observed.add("dataflow");
+    const steps = withFlow?.code_flows?.[0]?.thread_flows?.[0]?.locations ?? [];
+    const flow = steps.map((s) => ({
+      file: s.file ?? "",
+      fromLine: s.region?.start?.line ?? null,
+      fromColumn: s.region?.start?.column ?? null,
+      toLine: s.region?.end?.line ?? null,
+      toColumn: s.region?.end?.column ?? null
+    }));
+    issue.dataflow = flow.length ? flow : null;
+  }
+  return { ok: true, issue, observed, flowOmitted };
+}
+var NOT_RETURNED = "Not returned by the Issues API.";
+var ABSENT = [
+  ["epssScore", "The Issues API does not return EPSS. Use the Export API (--from-api) for EPSS."],
+  ["epssPercentile", "The Issues API does not return EPSS. Use the Export API (--from-api) for EPSS."],
+  [
+    "isCisaKev",
+    "The Issues API lists exploit sources but has no CISA KEV flag, and this tool does not infer one. Use the Export API (--from-api) for KEV."
+  ],
+  [
+    "fixability",
+    "The Issues API carries per-path fix flags, not Snyk's computed fixability, and this tool does not derive one."
+  ],
+  ["existsInDirectDependency", "The Issues API does not return dependency paths."],
+  ["deletedAt", "The Issues API never returns deleted issues, so none appear in this report."],
+  ["issueUrl", "The Issues API returns no browsable Snyk link for an issue."],
+  ["cvssAll", "Every CVSS assessment is read, but only the quoted figure and the v4 score are kept."],
+  ["assetFindingId", NOT_RETURNED],
+  ["issueSubType", NOT_RETURNED],
+  ["jiraIssues", NOT_RETURNED],
+  ["introductionCategory", NOT_RETURNED],
+  ["lastIgnored", NOT_RETURNED],
+  ["asset", NOT_RETURNED],
+  ["raw", "The raw issue is not retained by this ingestion path."]
+];
+var CARRIED = [
+  "group",
+  "project",
+  "cvss",
+  "cvssV4",
+  "nvdScore",
+  "nvdSeverity",
+  "exploitMaturity",
+  "exploitVocab",
+  "cve",
+  "cwe",
+  "fixedInAvailable",
+  "fixedInVersion",
+  "semverVulnerableRange",
+  "packageNameAndVersion",
+  "filePath",
+  "codeRegion",
+  "commitId",
+  "firstIntroduced",
+  "lastResolved",
+  "vulnerabilityPublicationDate",
+  "updatedAt",
+  "lastIntroduced",
+  "vulnDbUrl",
+  "issueType"
+];
+var UNOBSERVED_NOTE = {
+  score: "No issue in this run came back with a risk score; risk scoring may not be enabled for this tenant.",
+  riskFactors: "No issue in this run came back with risk factors; risk scoring may not be enabled for this tenant.",
+  reachability: "No issue in this run came back with reachability; it may not be enabled, or apply to none of these issues.",
+  dataflow: "No Snyk Code issue came back with a data flow; Issues API data flows may not be enabled for this tenant."
+};
+function restIssueAvailability(observed, notes = {}) {
+  const carried = (k) => [k, { state: "carried", reason: "carried", note: "" }];
+  const absent = (k, note) => [k, { state: "absent", reason: "source-limitation", note }];
+  return makeAvailability("issues-rest", [
+    ...CARRIED.map(carried),
+    ...OBSERVABLE_FIELDS.map(
+      (k) => observed.has(k) ? carried(k) : absent(k, notes[k] ?? UNOBSERVED_NOTE[k])
+    ),
+    ...ABSENT.map(([k, note]) => absent(k, note))
+  ]);
+}
+
 // snyk_report/lib/ingest/tests-api.mts
 var SAFE_ID = /^[A-Za-z0-9_-]+$/;
 function validId(value, label) {
@@ -1892,6 +2185,270 @@ async function ingestTestsApiFindings(client, orgId, testId, components, opts) {
       weakKeyCollisions: 0
     }
   };
+}
+
+// snyk_report/lib/ingest/issues-api.mts
+var joined = (v) => v?.length ? v.join(", ") : null;
+function toProjectRecord(p, orgId) {
+  const a = p.attributes ?? {};
+  const tags = (a.tags ?? []).filter((t) => t.key).map((t) => `${t.key}:${t.value ?? ""}`);
+  const counts = p.meta?.latest_issue_counts;
+  return {
+    id: p.id ?? "",
+    orgId,
+    name: a.name || null,
+    type: a.type || null,
+    origin: a.origin || null,
+    targetDisplayName: p.relationships?.target?.data?.attributes?.display_name || null,
+    targetReference: a.target_reference || null,
+    targetFile: a.target_file || null,
+    criticality: joined(a.business_criticality),
+    environment: joined(a.environment),
+    lifecycle: joined(a.lifecycle),
+    tags: tags.length ? tags : null,
+    latest: counts ? {
+      open: (counts.critical ?? 0) + (counts.high ?? 0) + (counts.medium ?? 0) + (counts.low ?? 0),
+      testedAt: parseSnykTimestamp(counts.updated_at)
+    } : null
+  };
+}
+async function fetchProjects(client, orgId, opts = {}) {
+  orgId = validId(orgId, "org id");
+  const params = { limit: "100", expand: "target" };
+  if (opts.withCounts) params["meta.latest_issue_counts"] = "true";
+  const out = /* @__PURE__ */ new Map();
+  for await (const p of client.paginate(`/rest/orgs/${orgId}/projects`, params)) {
+    if (p.id) out.set(p.id, toProjectRecord(p, orgId));
+  }
+  return out;
+}
+async function fetchOrg(client, orgId) {
+  try {
+    const doc = await client.get(
+      `/rest/orgs/${validId(orgId, "org id")}`
+    );
+    const a = doc.data?.attributes ?? {};
+    return {
+      org: { id: orgId, name: a.name || a.slug || null },
+      group: a.group_id ? { id: a.group_id, name: null } : null
+    };
+  } catch (err) {
+    log.dim(`could not look up organisation ${orgId}: ${err instanceof Error ? err.message : String(err)}`);
+    return { org: { id: orgId, name: null }, group: null };
+  }
+}
+async function ingestIssuesApi(client, req) {
+  const base = { limit: "100" };
+  if (req.createdAfter) base["created_after"] = req.createdAfter;
+  if (req.includeCodeFlows) base["include_code_flows"] = "true";
+  const wantTargets = req.targetNames?.length ? new Set(req.targetNames.map((t) => t.toLowerCase())) : null;
+  const targetsServerSide = req.scope.kind === "orgs";
+  const orgCache = /* @__PURE__ */ new Map();
+  const orgFor = (id) => {
+    let p = orgCache.get(id);
+    if (!p) orgCache.set(id, p = fetchOrg(client, id));
+    return p;
+  };
+  const projectCache = /* @__PURE__ */ new Map();
+  const projectsFor = (orgId) => {
+    let p = projectCache.get(orgId);
+    if (!p) {
+      p = fetchProjects(client, orgId).catch((err) => {
+        if (wantTargets) throw err;
+        log.warn(
+          `could not list projects in organisation ${orgId}: ${err instanceof Error ? err.message : String(err)}`
+        );
+        log.warn("  its issues will carry no project or target names");
+        return /* @__PURE__ */ new Map();
+      });
+      projectCache.set(orgId, p);
+    }
+    return p;
+  };
+  const passes = [];
+  if (req.scope.kind === "orgs") {
+    const orgId = validId(req.scope.id, "--org");
+    if (wantTargets) {
+      const projects = [...(await projectsFor(orgId)).values()].filter(
+        (p) => p.targetDisplayName && wantTargets.has(p.targetDisplayName.toLowerCase())
+      );
+      log.dim(`${projects.length} project(s) under the chosen target(s)`);
+      for (const p of projects) {
+        passes.push({
+          path: `/rest/orgs/${orgId}/issues`,
+          params: { ...base, "scan_item.id": p.id, "scan_item.type": "project" },
+          label: p.name ?? p.id
+        });
+      }
+    } else {
+      passes.push({ path: `/rest/orgs/${orgId}/issues`, params: base, label: req.scope.label });
+    }
+  } else if (req.orgIds?.length) {
+    for (const id of req.orgIds) {
+      passes.push({ path: `/rest/orgs/${validId(id, "org id")}/issues`, params: base, label: id });
+    }
+  } else {
+    passes.push({
+      path: `/rest/groups/${validId(req.scope.id, "--group")}/issues`,
+      params: base,
+      label: req.scope.label
+    });
+  }
+  const groupRef = req.scope.kind === "groups" ? { id: req.scope.id, name: null } : null;
+  const issues = [];
+  const seen = /* @__PURE__ */ new Set();
+  const problems = [];
+  const dropped = { deleted: 0, unparseable: 0, duplicate: 0, filtered: 0 };
+  const observed = /* @__PURE__ */ new Set();
+  let rowsRead = 0;
+  let info = 0;
+  let codeIssues = 0;
+  let flowsOmitted = 0;
+  for (const pass of passes) {
+    if (passes.length > 1) log.dim(`reading ${pass.label}`);
+    for await (const raw of client.paginate(pass.path, pass.params)) {
+      rowsRead++;
+      if (rowsRead % 1e3 === 0) log.dim(`${rowsRead.toLocaleString()} issues read`);
+      const orgId = raw.relationships?.organization?.data?.id ?? (req.scope.kind === "orgs" ? req.scope.id : "");
+      const scanItem = raw.relationships?.scan_item?.data;
+      const orgRec = orgId ? await orgFor(orgId) : { org: { id: "unknown", name: null }, group: null };
+      const project = orgId && scanItem?.type === "project" && scanItem.id ? (await projectsFor(orgId)).get(scanItem.id) ?? null : null;
+      if (wantTargets && !targetsServerSide) {
+        const t = project?.targetDisplayName?.toLowerCase();
+        if (!t || !wantTargets.has(t)) {
+          dropped.filtered++;
+          continue;
+        }
+      }
+      const out = normalizeRestIssue(raw, { org: orgRec.org, group: groupRef ?? orgRec.group, project });
+      if (!out.ok) {
+        if (out.reason === "filtered") info++;
+        dropped[out.reason]++;
+        if (out.reason === "unparseable" && out.detail && problems.length < 20) problems.push(out.detail);
+        continue;
+      }
+      if (seen.has(out.issue.issueKey)) {
+        dropped.duplicate++;
+        continue;
+      }
+      seen.add(out.issue.issueKey);
+      for (const f of out.observed) observed.add(f);
+      if (out.issue.product === "code") codeIssues++;
+      if (out.flowOmitted) flowsOmitted++;
+      issues.push(out.issue);
+    }
+  }
+  if (info) log.dim(`${info.toLocaleString()} info-severity issue(s) skipped (the report ranks low and up)`);
+  if (flowsOmitted) {
+    log.dim(`${flowsOmitted.toLocaleString()} Snyk Code data flow(s) were over Snyk's 20 KB limit and omitted`);
+  }
+  for (const f of OBSERVABLE_FIELDS) {
+    if (observed.has(f)) continue;
+    for (const issue of issues) delete issue[f];
+  }
+  const notes = {};
+  if (!req.includeCodeFlows) notes.dataflow = "Snyk Code data flows were not requested (--no-dataflow).";
+  else if (codeIssues === 0) notes.dataflow = "No Snyk Code issues in this run, so there were no data flows to read.";
+  return {
+    issues,
+    summary: {
+      header: canonicaliseHeader([
+        "PROBLEM_ID",
+        "PROBLEM_TITLE",
+        "ISSUE_SEVERITY",
+        "ISSUE_STATUS",
+        "PRODUCT_NAME",
+        "ORG_PUBLIC_ID"
+      ]),
+      availability: restIssueAvailability(observed, notes),
+      rowsRead,
+      dropped,
+      unknownColumns: [],
+      problems,
+      keyStrength: "strong",
+      weakKeyCollisions: 0,
+      noFindings: issues.length === 0
+    }
+  };
+}
+
+// snyk_report/lib/freshness.mts
+var REPORTING_LAG_MS = 3 * 60 * 6e4;
+var MAX_ORGS = 25;
+function findStaleProjects(projects, exported, opts) {
+  const rows = /* @__PURE__ */ new Map();
+  const open2 = /* @__PURE__ */ new Map();
+  for (const i of exported) {
+    const id = i.project?.id;
+    if (!id) continue;
+    rows.set(id, (rows.get(id) ?? 0) + 1);
+    if (i.status === "open" && !i.deletedAt) open2.set(id, (open2.get(id) ?? 0) + 1);
+  }
+  const window = opts.windowMs ?? REPORTING_LAG_MS;
+  const want = opts.targetNames?.length ? new Set(opts.targetNames.map((t) => t.toLowerCase())) : null;
+  const out = [];
+  for (const p of projects) {
+    const testedAt = p.latest?.testedAt;
+    if (!p.latest || !testedAt) continue;
+    if (want && !(p.targetDisplayName && want.has(p.targetDisplayName.toLowerCase()))) continue;
+    if (opts.now - testedAt.ms > window) continue;
+    const exportedOpen = open2.get(p.id) ?? 0;
+    const behind = opts.compareCounts ? exportedOpen !== p.latest.open : (rows.get(p.id) ?? 0) === 0 && p.latest.open > 0;
+    if (!behind) continue;
+    const name = p.targetDisplayName && p.name && !p.name.startsWith(p.targetDisplayName) ? `${p.targetDisplayName} (${p.name})` : p.name ?? p.targetDisplayName ?? p.id;
+    out.push({ id: p.id, name, live: p.latest.open, exported: exportedOpen, testedAt });
+  }
+  return out.sort((a, b) => b.testedAt.ms - a.testedAt.ms);
+}
+function ago(ms, now) {
+  const minutes = Math.max(0, Math.round((now - ms) / 6e4));
+  if (minutes < 1) return "just now";
+  if (minutes < 90) return `${minutes} min ago`;
+  return `${(minutes / 60).toFixed(1)} h ago`;
+}
+async function checkExportFreshness(client, req) {
+  let orgIds = req.orgIds?.length ? [...req.orgIds] : req.scope.kind === "orgs" ? [req.scope.id] : null;
+  if (!orgIds) {
+    const orgs = await tryList("organisations", () => listOrgsInGroup(client, req.scope.id));
+    orgIds = orgs?.map((o) => o.id) ?? null;
+  }
+  if (!orgIds?.length) return null;
+  if (orgIds.length > MAX_ORGS) {
+    log.dim(
+      `freshness check skipped: ${orgIds.length} organisations is too many to check project by project`
+    );
+    return null;
+  }
+  log.step("Checking the export against each project's latest test");
+  const now = Date.now();
+  let stale;
+  try {
+    const projects = [];
+    for (const id of orgIds) projects.push(...(await fetchProjects(client, id, { withCounts: true })).values());
+    stale = findStaleProjects(projects, req.exported, {
+      now,
+      compareCounts: req.allTime,
+      targetNames: req.targetNames
+    });
+  } catch (err) {
+    log.dim(`freshness check skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+  if (stale.length === 0) {
+    log.dim("no project tested in the last 3 hours is out of step with the export");
+    return null;
+  }
+  log.warn(
+    `${stale.length} project(s) were tested in the last 3 hours and the export does not match their latest results yet:`
+  );
+  for (const s of stale.slice(0, 10)) {
+    log.warn(`  ${s.name}: ${s.live} open now, ${s.exported} in the export (tested ${ago(s.testedAt.ms, now)})`);
+  }
+  if (stale.length > 10) log.warn(`  ...and ${stale.length - 10} more`);
+  log.warn(
+    "  The Export API refreshes about every 2 hours. For results from a scan that just finished, re-run with --from-issues-api."
+  );
+  return `${stale.length} project(s) tested shortly before this report did not yet match the Export API, so their latest results may be missing. --from-issues-api reads live data.`;
 }
 
 // snyk_report/lib/interactive.mts
@@ -2586,8 +3143,13 @@ async function selectSource() {
   return choose("Where should the vulnerability data come from?", [
     {
       value: "api",
-      label: "Pull it from Snyk now",
-      hint: "needs an API token; returns every field"
+      label: "Pull a full export from Snyk",
+      hint: "Export API: every field, but lags new scans by about 2 hours"
+    },
+    {
+      value: "issues-api",
+      label: "Pull live results from Snyk",
+      hint: "Issues API: includes scans that just finished; no EPSS or KEV"
     },
     {
       value: "csv",
@@ -3132,10 +3694,10 @@ function listOf(items) {
 }
 function coverPage(ctx) {
   const { data, meta } = ctx;
-  const uniq = new Set(data.issues.map((i) => i.problemId)).size;
+  const uniq2 = new Set(data.issues.map((i) => i.problemId)).size;
   const tiles = [
     { n: fmt(data.total), l: "Issues reported" },
-    { n: fmt(uniq), l: "Unique vulnerabilities", color: C.accent },
+    { n: fmt(uniq2), l: "Unique vulnerabilities", color: C.accent },
     { n: fmt(data.bySeverity.critical), l: "Critical", color: SEV.critical.color }
   ];
   if (ctx.has("fixability")) {
@@ -3228,6 +3790,7 @@ function detailsPage(ctx) {
   ];
   if (meta.region) inputRows.push(["Region", esc(meta.region)]);
   if (meta.dataAsOf) inputRows.push(["Data as of", esc(meta.dataAsOf)]);
+  if (meta.freshness) inputRows.push(["Freshness", esc(meta.freshness)]);
   inputRows.push(["Generated", esc(meta.generatedAt)]);
   const d = meta.dropped;
   const volumeRows = [
@@ -3338,7 +3901,7 @@ function tocPage(ctx) {
 }
 function execPage(ctx) {
   const { data } = ctx;
-  const uniq = new Set(data.issues.map((i) => i.problemId)).size;
+  const uniq2 = new Set(data.issues.map((i) => i.problemId)).size;
   const tiles = SEVERITIES.map(
     (s) => `<div class="tile tint-${s}"><div class="t">${sevBadge(s, "md")}${SEV[s].label}</div>
        <div class="n">${fmt(data.bySeverity[s])}</div></div>`
@@ -3368,7 +3931,7 @@ function execPage(ctx) {
      <div class="bigrow">
        <div class="big"><div class="l">Issues reported</div><div class="n">${fmt(data.total)}</div></div>
        <div class="big"><div class="l">Unique vulns</div>
-         <div class="n" style="color:${C.accent}">${fmt(uniq)}</div></div>
+         <div class="n" style="color:${C.accent}">${fmt(uniq2)}</div></div>
        <div class="tiles">${tiles}</div>
      </div>
      ${topList}
@@ -4467,6 +5030,18 @@ Pull straight from the Snyk API instead of a file:
                         rather than spending another of your 20 exports/hour.
   --export-timeout <m>  minutes to wait for the job (default: 30)
 
+  The Export API reads Snyk's reporting store, which refreshes about every
+  2 hours, so a scan that just finished may not be in it yet. Each run checks
+  recently tested projects against the export and warns when they disagree.
+
+Or read live results (Issues REST API) -- use this right after a scan:
+  --from-issues-api     read the live issue store the project page uses.
+                        Takes the same --region, --org, --group, --target,
+                        --project and --since flags as --from-api. Carries
+                        Snyk Code data flows; does not carry EPSS, CISA KEV,
+                        computed fixability or deleted issues.
+  --no-dataflow         skip Snyk Code data flows (smaller, faster responses)
+
 Or run a fresh Snyk Code scan directly and report on just that (also Tests
 v2 API; useful to target one repo without an Export API run first):
   --from-tests-api      run a new scan instead of reading an existing result
@@ -4503,6 +5078,7 @@ async function main() {
       product: { type: "string" },
       "export-id": { type: "string" },
       "export-timeout": { type: "string", default: "30" },
+      "from-issues-api": { type: "boolean", default: false },
       "from-tests-api": { type: "boolean", default: false },
       "repo-url": { type: "string" },
       "integration-id": { type: "string" },
@@ -4547,8 +5123,16 @@ async function main() {
     return 0;
   }
   const useTestsApi = values["from-tests-api"];
+  let useIssuesApi = values["from-issues-api"];
+  if (useIssuesApi && useTestsApi) fail("pass either --from-issues-api or --from-tests-api, not both.");
+  if (useIssuesApi && (values["from-api"] || values.csv)) {
+    fail("pass --from-issues-api on its own, not together with --csv or --from-api.");
+  }
+  if (useIssuesApi && values["export-id"]) {
+    fail("--export-id re-attaches to an Export API job; it has no meaning with --from-issues-api.");
+  }
   const apiFlags = ["region", "org", "group", "since", "export-id", "target"];
-  let useApi = !useTestsApi && (values["from-api"] || apiFlags.some((f) => values[f] !== void 0));
+  let useApi = !useTestsApi && !useIssuesApi && (values["from-api"] || apiFlags.some((f) => values[f] !== void 0));
   if (useTestsApi && (useApi || values.csv)) {
     fail("pass --from-tests-api on its own, not together with --csv or --from-api.");
   }
@@ -4563,13 +5147,19 @@ async function main() {
     fail("--from-tests-api needs --org <org_id> (the Tests API has no group scope).");
   }
   let csvPathFromPrompt;
-  if (!useApi && !useTestsApi && !values.csv) {
+  if (!useApi && !useTestsApi && !useIssuesApi && !values.csv) {
     if (!isInteractive()) {
-      fail("nothing to report on. Pass --csv <file>, --from-api or --from-tests-api, or --help for usage.");
+      fail(
+        "nothing to report on. Pass --csv <file>, --from-api, --from-issues-api or --from-tests-api, or --help for usage."
+      );
     }
     const source = await selectSource();
     if (source === "api") useApi = true;
+    else if (source === "issues-api") useIssuesApi = true;
     else csvPathFromPrompt = await askCsvPath();
+  }
+  if (useIssuesApi && values["include-deleted"]) {
+    log.warn("--include-deleted has no effect here: the Issues API never returns deleted issues.");
   }
   try {
     await selectSeverities(values.severity ?? "all");
@@ -4590,7 +5180,9 @@ async function main() {
   let targetFilter;
   let scopeOrgIds;
   let formatSpec = values.format;
-  if (useApi) {
+  let dataAsOf = null;
+  let freshness = null;
+  if (useApi || useIssuesApi) {
     const conn = await connect({ region: values.region, token: process.env["SNYK_TOKEN"] });
     regionLabel = conn.regionLabel;
     apiClient = conn.client;
@@ -4606,21 +5198,46 @@ async function main() {
     scopeOrgIds = selection.orgIds ?? (selection.scope.kind === "orgs" ? [selection.scope.id] : void 0);
     const since = await selectSince(values.since);
     periodLabel = describeSince(since);
-    const filters = {
-      ...sinceToFilters(since),
-      ...selection.orgIds ? { orgs: selection.orgIds } : {},
-      ...selection.targetNames ? { targetDisplayNames: selection.targetNames } : {}
-    };
-    outcome = await runExport(
-      conn.client,
-      selection.scope,
-      filters,
-      values["export-id"],
-      Number(values["export-timeout"]) || 30,
-      values["include-deleted"]
-    );
-    sourceLabel = "Snyk Export API";
     sourceDetail = `${selection.scope.label} - ${conn.regionLabel}`;
+    if (useIssuesApi) {
+      log.step(`Reading live issues for ${selection.scope.label}`);
+      outcome = await ingestIssuesApi(conn.client, {
+        scope: selection.scope,
+        orgIds: selection.orgIds,
+        targetNames: selection.targetNames,
+        // "All time" needs no date here: unlike the export, this endpoint
+        // does not demand one.
+        createdAfter: since === "all" ? void 0 : sinceToFilters(since).introducedFrom,
+        includeCodeFlows: !values["no-dataflow"]
+      });
+      sourceLabel = "Snyk Issues API (live)";
+      dataAsOf = `Live issue data, read ${(/* @__PURE__ */ new Date()).toLocaleString(void 0, {
+        dateStyle: "long",
+        timeStyle: "short"
+      })}`;
+    } else {
+      const filters = {
+        ...sinceToFilters(since),
+        ...selection.orgIds ? { orgs: selection.orgIds } : {},
+        ...selection.targetNames ? { targetDisplayNames: selection.targetNames } : {}
+      };
+      outcome = await runExport(
+        conn.client,
+        selection.scope,
+        filters,
+        values["export-id"],
+        Number(values["export-timeout"]) || 30,
+        values["include-deleted"]
+      );
+      sourceLabel = "Snyk Export API";
+      freshness = await checkExportFreshness(conn.client, {
+        scope: selection.scope,
+        orgIds: selection.orgIds,
+        targetNames: selection.targetNames,
+        exported: outcome.issues,
+        allTime: since === "all"
+      });
+    }
   } else if (useTestsApi) {
     const conn = await connect({ region: values.region, token: process.env["SNYK_TOKEN"] });
     regionLabel = conn.regionLabel;
@@ -4828,6 +5445,8 @@ async function main() {
       ...projectFilter ? [`projects: ${projectFilter.join(", ")}`] : []
     ].join("; "),
     ...regionLabel ? { region: regionLabel } : {},
+    ...dataAsOf ? { dataAsOf } : {},
+    ...freshness ? { freshness } : {},
     rowsRead: summary.rowsRead,
     dropped: summary.dropped,
     // Absent keys rather than nulls: the renderer omits the cover's report-id
