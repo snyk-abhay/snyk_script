@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // snyk_report/snyk-auto-report.mts
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, resolve as resolve2 } from "node:path";
+import { mkdir, readFile as readFile3, rm as rm2, writeFile } from "node:fs/promises";
+import { basename as basename2, dirname, resolve as resolve3 } from "node:path";
 import { parseArgs } from "node:util";
 
 // snyk_report/lib/model.mts
@@ -669,8 +669,8 @@ async function* csvRecords(input, opts = {}) {
     const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
     for (const rec of parser.write(text)) yield rec;
   }
-  const tail = decoder.decode();
-  if (tail) for (const rec of parser.write(tail)) yield rec;
+  const tail2 = decoder.decode();
+  if (tail2) for (const rec of parser.write(tail2)) yield rec;
   for (const rec of parser.end()) yield rec;
 }
 var INJECTION_PREFIX = /^[=+\-@\t\r]/;
@@ -1934,7 +1934,7 @@ function restIssueAvailability(observed, notes = {}) {
   return makeAvailability("issues-rest", [
     ...CARRIED.map(carried),
     ...OBSERVABLE_FIELDS.map(
-      (k) => observed.has(k) ? carried(k) : absent(k, notes[k] ?? UNOBSERVED_NOTE[k])
+      (k) => observed.has(k) ? carried(k) : absent(k, notes[open sn k] ?? UNOBSERVED_NOTE[k])
     ),
     ...ABSENT.map(([k, note]) => absent(k, note))
   ]);
@@ -2451,10 +2451,564 @@ async function checkExportFreshness(client, req) {
   return `${stale.length} project(s) tested shortly before this report did not yet match the Export API, so their latest results may be missing. --from-issues-api reads live data.`;
 }
 
+// snyk_report/lib/ingest/cli-scan.mts
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+
+// snyk_report/lib/normalize/cli-output.mts
+var SARIF_LEVEL = { error: "high", warning: "medium", note: "low" };
+function uriPath(uri) {
+  if (!uri) return "";
+  try {
+    return decodeURIComponent(uri).replace(/^file:\/\//, "");
+  } catch {
+    return uri;
+  }
+}
+function step(p) {
+  const r = p?.region ?? {};
+  return {
+    file: uriPath(p?.artifactLocation?.uri),
+    fromLine: r.startLine ?? null,
+    fromColumn: r.startColumn ?? null,
+    toLine: r.endLine ?? r.startLine ?? null,
+    toColumn: r.endColumn ?? null
+  };
+}
+function isSnykCodeSarif(doc) {
+  const runs = doc?.runs;
+  return Array.isArray(runs);
+}
+function normalizeSarif(doc, ctx) {
+  const issues = [];
+  const problems = [];
+  let rowsRead = 0;
+  let unparseable = 0;
+  const project = { name: `${ctx.target} (Snyk Code)`, type: "sast", targetDisplayName: ctx.target };
+  for (const run of doc.runs ?? []) {
+    const rules = run.tool?.driver?.rules ?? [];
+    for (const res of run.results ?? []) {
+      rowsRead++;
+      const rule = (res.ruleIndex != null ? rules[res.ruleIndex] : void 0) ?? rules.find((r) => r.id === res.ruleId);
+      const severity = SARIF_LEVEL[res.level ?? rule?.defaultConfiguration?.level ?? ""];
+      const ruleId = res.ruleId ?? rule?.id ?? "";
+      if (!severity || !ruleId) {
+        unparseable++;
+        if (problems.length < 20) problems.push(`SARIF result ${rowsRead}: no rule id or unknown level ${res.level}`);
+        continue;
+      }
+      const loc = step(res.locations?.[0]?.physicalLocation);
+      const flow = (res.codeFlows?.[0]?.threadFlows?.[0]?.locations ?? []).map((l) => step(l.location?.physicalLocation));
+      const fp = res.fingerprints ?? {};
+      const afid = fp["snyk/asset/finding/v1"] ?? null;
+      const stable = fp["identity"] ?? afid ?? fp["0"] ?? null;
+      const identity = stable ? { key: `sarif:${stable}`, strength: "strong" } : issueIdentity({ orgId: ctx.org.id, problemId: ruleId, filePath: loc.file, startLine: loc.fromLine });
+      issues.push({
+        source: "cli",
+        issueKey: identity.key,
+        problemId: ruleId,
+        title: rule?.shortDescription?.text || rule?.name || ruleId,
+        severity,
+        status: res.suppressions?.some((s) => s.status !== "rejected") ? "ignored" : "open",
+        product: "code",
+        org: ctx.org,
+        project,
+        issueType: "Code",
+        message: res.message?.text ?? null,
+        cwe: rule?.properties?.cwe?.length ? [...rule.properties.cwe] : null,
+        score: typeof res.properties?.priorityScore === "number" ? res.properties.priorityScore : null,
+        filePath: loc.file || null,
+        codeRegion: loc.fromLine == null ? null : {
+          raw: `${loc.fromLine}:${loc.fromColumn ?? ""}-${loc.toLine ?? ""}:${loc.toColumn ?? ""}`,
+          startLine: loc.fromLine,
+          endLine: loc.toLine,
+          startColumn: loc.fromColumn,
+          endColumn: loc.toColumn
+        },
+        dataflow: flow.length ? flow : null,
+        assetFindingId: afid
+      });
+    }
+  }
+  return { issues, rowsRead, unparseable, problems };
+}
+function isSnykTestJson(doc) {
+  const one = (d) => typeof d === "object" && d !== null && ("vulnerabilities" in d || "error" in d || "ok" in d);
+  return Array.isArray(doc) ? doc.every(one) : one(doc);
+}
+function cvssEntries(v) {
+  const fromSources = (v.cvssSources ?? []).map((s) => ({
+    source: s.assigner ?? "unknown",
+    version: s.cvssVersion ?? (s.vector ? parseCvssVector(s.vector).version ?? "" : ""),
+    score: typeof s.baseScore === "number" ? s.baseScore : null,
+    vector: s.vector ?? null,
+    level: normalizeSeverity(s.severity)
+  }));
+  if (fromSources.length || v.cvssScore == null && !v.CVSSv3) return fromSources;
+  return [
+    {
+      source: "Snyk",
+      version: v.CVSSv3 ? parseCvssVector(v.CVSSv3).version ?? "3.1" : "3.1",
+      score: v.cvssScore ?? null,
+      vector: v.CVSSv3 ?? null,
+      level: null
+    }
+  ];
+}
+function exploitOf(v) {
+  const levels = v.exploitDetails?.maturityLevels ?? [];
+  if (levels.length) {
+    return normalizeExploitMaturity(
+      levels.find((l) => !/v4/i.test(l.format ?? ""))?.level,
+      levels.find((l) => /v4/i.test(l.format ?? ""))?.level
+    );
+  }
+  const legacy = normalizeExploitMaturity(v.exploit, null);
+  return legacy.value ? legacy : normalizeExploitMaturity(null, v.exploit);
+}
+function normalizeSnykTest(doc, ctx) {
+  const results = Array.isArray(doc) ? doc : [doc];
+  const problems = [];
+  const issues = [];
+  let rowsRead = 0;
+  let unparseable = 0;
+  for (const r of results) {
+    if (r.error && !r.vulnerabilities) {
+      problems.push(`snyk test: ${r.error}`);
+      continue;
+    }
+    const manifest = r.displayTargetFile ?? r.path ?? "";
+    const project = {
+      name: manifest ? `${r.projectName ?? ctx.target} (${manifest})` : r.projectName ?? ctx.target,
+      type: r.packageManager ?? null,
+      targetDisplayName: ctx.target,
+      targetFile: manifest || null
+    };
+    const org = r.org ? { id: r.org, name: r.org } : ctx.org;
+    const groups = /* @__PURE__ */ new Map();
+    const take = (list2, ignored) => {
+      for (const v of list2 ?? []) {
+        rowsRead++;
+        const k = `${v.id}|${v.packageName}@${v.version}`;
+        const g = groups.get(k);
+        if (g) g.paths.push(v.from ?? []);
+        else groups.set(k, { v, paths: [v.from ?? []], ignored });
+      }
+    };
+    take(r.vulnerabilities, false);
+    take(r.filtered?.ignore, true);
+    for (const [k, { v, paths, ignored }] of groups) {
+      const severity = normalizeSeverity(v.severityWithCritical ?? v.severity);
+      if (!v.id || !severity) {
+        unparseable++;
+        if (problems.length < 20) problems.push(`snyk test: ${v.id ?? "?"} has no id or an unknown severity`);
+        continue;
+      }
+      const cvss = pickCvss(cvssEntries(v));
+      const em = exploitOf(v);
+      const fixedIn = [...new Set(v.fixedIn ?? [])];
+      const ranges = v.semver?.vulnerable ?? [];
+      const license = v.type === "license";
+      issues.push({
+        source: "cli",
+        // Not a Snyk-assigned id, but deliberately unique: paths are folded
+        // into one finding per manifest, vulnerability and package above.
+        issueKey: `cli-sca:${manifest}|${k}`,
+        problemId: v.id,
+        title: v.title || v.id,
+        severity,
+        status: ignored ? "ignored" : "open",
+        product: "open-source",
+        org,
+        project,
+        issueType: license ? "License" : "Vulnerability",
+        packageNameAndVersion: v.packageName ? `${v.packageName}@${v.version ?? ""}` : null,
+        cvss: cvss.primary,
+        cvssV4: cvss.v4,
+        nvdScore: cvss.nvdScore,
+        nvdSeverity: cvss.nvdSeverity,
+        epssScore: parseNumber(v.epssDetails?.probability ?? null),
+        epssPercentile: parseNumber(v.epssDetails?.percentile ?? null),
+        exploitMaturity: em.value,
+        exploitVocab: em.vocab,
+        cve: v.identifiers?.CVE?.length ? [...v.identifiers.CVE] : null,
+        cwe: v.identifiers?.CWE?.length ? [...v.identifiers.CWE] : null,
+        fixedInVersion: fixedIn.length ? fixedIn.join(", ") : null,
+        fixedInAvailable: license ? null : fixedIn.length > 0,
+        semverVulnerableRange: ranges.length ? ranges.join(", ") : null,
+        // A path is [project, direct dependency, ...]: length 2 means direct.
+        existsInDirectDependency: paths.some((p) => p.length === 2),
+        vulnerabilityPublicationDate: parseSnykTimestamp(v.publicationTime ?? v.disclosureTime),
+        vulnDbUrl: /^SNYK-/.test(v.id) ? `https://security.snyk.io/vuln/${v.id}` : null
+      });
+    }
+  }
+  return { issues, rowsRead, unparseable, problems };
+}
+var CODE_FIELDS = [
+  "filePath",
+  "codeRegion",
+  "dataflow",
+  "message",
+  "score",
+  "assetFindingId"
+];
+var OPEN_SOURCE_FIELDS = [
+  "packageNameAndVersion",
+  "cvss",
+  "cvssV4",
+  "nvdScore",
+  "nvdSeverity",
+  "epssScore",
+  "epssPercentile",
+  "exploitMaturity",
+  "exploitVocab",
+  "cve",
+  "fixedInVersion",
+  "fixedInAvailable",
+  "semverVulnerableRange",
+  "existsInDirectDependency",
+  "vulnerabilityPublicationDate",
+  "vulnDbUrl"
+];
+var BOTH_FIELDS = ["project", "cwe", "issueType"];
+var POINT_IN_TIME = "A CLI scan is a point-in-time result; it carries no history.";
+var ABSENT2 = [
+  ["group", "The CLI does not report group membership."],
+  ["riskFactors", "The CLI reports no risk factors."],
+  ["cvssAll", "Every CVSS assessment is read, but only the quoted figure and the v4 score are kept."],
+  [
+    "fixability",
+    "The CLI reports per-path upgrade and patch flags, not Snyk's computed fixability, and this tool does not derive one."
+  ],
+  ["reachability", "Not requested from the CLI."],
+  ["commitId", "A local scan is of the working tree, not a commit."],
+  ["isCisaKev", "The CLI does not report CISA KEV membership."],
+  ["firstIntroduced", POINT_IN_TIME],
+  ["lastIntroduced", POINT_IN_TIME],
+  ["lastResolved", POINT_IN_TIME],
+  ["lastIgnored", POINT_IN_TIME],
+  ["updatedAt", POINT_IN_TIME],
+  ["deletedAt", POINT_IN_TIME],
+  ["issueUrl", "A local scan creates nothing in Snyk, so there is no issue page to link to."],
+  ["issueSubType", "Not reported by the CLI."],
+  ["jiraIssues", "Not reported by the CLI."],
+  ["introductionCategory", "Not reported by the CLI."],
+  ["asset", "Not reported by the CLI."],
+  ["raw", "The raw output is not retained by this ingestion path."]
+];
+function cliAvailability(ran) {
+  const carried = (k) => [k, { state: "carried", reason: "carried", note: "" }];
+  const absent = (k, note) => [k, { state: "absent", reason: "source-limitation", note }];
+  return makeAvailability("cli", [
+    ...CODE_FIELDS.map(
+      (k) => ran.code ? carried(k) : absent(k, "The Snyk Code scan (snyk code test) was not part of this run.")
+    ),
+    ...OPEN_SOURCE_FIELDS.map(
+      (k) => ran.openSource ? carried(k) : absent(k, "The Open Source scan (snyk test) was not part of this run.")
+    ),
+    ...BOTH_FIELDS.map(carried),
+    ...ABSENT2.map(([k, note]) => absent(k, note))
+  ]);
+}
+
+// snyk_report/lib/ingest/cli-scan.mts
+function tail(text, lines = 12) {
+  return text.trim().split(/\r?\n/).slice(-lines).join("\n");
+}
+function runSnyk(bin, args, opts) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(bin, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const keep = (d) => {
+      output = (output + d.toString()).slice(-16e3);
+    };
+    child.stdout.on("data", keep);
+    child.stderr.on("data", keep);
+    const timer = setTimeout(() => child.kill("SIGTERM"), opts.timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(
+        err.code === "ENOENT" ? new Error(
+          `the Snyk CLI was not found (${bin}). Install it with "npm install -g snyk", or set SNYK_CLI to its path.`
+        ) : err
+      );
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (signal) {
+        reject(new Error(`snyk ${args.slice(0, 2).join(" ")} was stopped after the timeout (--scan-timeout).`));
+        return;
+      }
+      resolveRun({ code, output });
+    });
+  });
+}
+async function runCliScans(req) {
+  const bin = process.env["SNYK_CLI"] || "snyk";
+  const env = { ...process.env, ...req.apiUrl ? { SNYK_API: req.apiUrl } : {} };
+  const orgArg = req.org ? [`--org=${req.org}`] : [];
+  const version = await runSnyk(bin, ["--version"], { cwd: req.dir, env, timeoutMs: 6e4 });
+  if (version.code !== 0) throw new Error(`could not run the Snyk CLI:
+${tail(version.output)}`);
+  const v = version.output.trim().split(/\s+/)[0] ?? "";
+  log.dim(`Snyk CLI ${v}`);
+  const work = await mkdtemp(join(tmpdir(), "snyk-auto-report-"));
+  const cleanup = () => rm(work, { recursive: true, force: true });
+  const scans = [];
+  if (req.code) {
+    const file = join(work, "code.sarif");
+    scans.push({
+      name: "snyk code test",
+      args: ["code", "test", ".", `--sarif-file-output=${file}`, ...orgArg],
+      file,
+      nothing: "no files Snyk Code supports"
+    });
+  }
+  if (req.openSource) {
+    const file = join(work, "open-source.json");
+    scans.push({
+      name: "snyk test",
+      args: ["test", ".", "--all-projects", `--json-file-output=${file}`, ...orgArg],
+      file,
+      nothing: "no manifest or lockfile Snyk Open Source supports"
+    });
+  }
+  try {
+    log.step(`Scanning ${req.dir} with ${scans.map((s) => s.name).join(" and ")}`);
+    const runs = await Promise.all(
+      scans.map((s) => runSnyk(bin, s.args, { cwd: req.dir, env, timeoutMs: req.timeoutMs }))
+    );
+    const files = [];
+    runs.forEach((run, i) => {
+      const s = scans[i];
+      if (run.code === 0 || run.code === 1) {
+        files.push(s.file);
+      } else if (run.code === 3) {
+        log.warn(`${s.name}: ${s.nothing} in this folder; nothing to report from it`);
+      } else {
+        throw new Error(
+          `${s.name} failed (exit ${run.code}). Its output ended:
+${tail(run.output)}
+  Fix that, or narrow the run with --product sast or --product sca.`
+        );
+      }
+    });
+    if (files.length === 0) {
+      throw new Error(
+        `Snyk found nothing it can test in ${req.dir}: no supported source files or manifests. Check --path.`
+      );
+    }
+    return { files, version: v, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
+}
+async function ingestCliResults(files, opts) {
+  const fallbackOrg = opts.org ? { id: opts.org, name: opts.org } : { id: "cli-default", name: "Snyk CLI default organisation" };
+  const ctx = { org: fallbackOrg, target: basename(opts.dir) };
+  const issues = [];
+  const problems = [];
+  let rowsRead = 0;
+  let unparseable = 0;
+  let duplicate = 0;
+  const seen = /* @__PURE__ */ new Set();
+  const ran = { code: opts.ran?.code ?? false, openSource: opts.ran?.openSource ?? false };
+  for (const file of files) {
+    let doc;
+    try {
+      doc = JSON.parse(await readFile(file, "utf8"));
+    } catch (err) {
+      throw new Error(`${file} is not readable JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    let part;
+    if (isSnykCodeSarif(doc)) {
+      const driver = doc.runs?.[0]?.tool?.driver?.name;
+      if (driver && driver !== "SnykCode") {
+        throw new Error(
+          `${file} is SARIF from ${driver}, not Snyk Code. For Open Source, use "snyk test --json" output.`
+        );
+      }
+      part = normalizeSarif(doc, ctx);
+      ran.code = true;
+    } else if (isSnykTestJson(doc)) {
+      part = normalizeSnykTest(doc, ctx);
+      ran.openSource = true;
+    } else {
+      throw new Error(`${file} is neither Snyk Code SARIF nor "snyk test --json" output.`);
+    }
+    rowsRead += part.rowsRead;
+    unparseable += part.unparseable;
+    problems.push(...part.problems);
+    for (const i of part.issues) {
+      if (seen.has(i.issueKey)) {
+        duplicate++;
+        continue;
+      }
+      seen.add(i.issueKey);
+      issues.push(i);
+    }
+  }
+  for (const p of problems) if (p.startsWith("snyk test:")) log.warn(p);
+  const named = issues.find((i) => i.product === "open-source")?.org;
+  if (named) {
+    for (const i of issues) if (i.org.id === fallbackOrg.id) i.org = named;
+  }
+  const availability = cliAvailability(ran);
+  for (const [k, e] of availability.byField) {
+    if (e.state === "absent") continue;
+    for (const i of issues) {
+      if (!(k in i)) i[k] = null;
+    }
+  }
+  return {
+    issues,
+    summary: {
+      header: canonicaliseHeader(["PROBLEM_ID", "PROBLEM_TITLE", "ISSUE_SEVERITY", "PRODUCT_NAME", "FILE_PATH"]),
+      availability,
+      rowsRead,
+      dropped: { deleted: 0, unparseable, duplicate, filtered: 0 },
+      unknownColumns: [],
+      problems,
+      keyStrength: "strong",
+      weakKeyCollisions: 0,
+      noFindings: issues.length === 0
+    }
+  };
+}
+
+// snyk_report/lib/source-context.mts
+import { readFile as readFile2, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+var MAX_FILE_BYTES = 2 * 1024 * 1024;
+var MAX_EXCERPT_LINES = 60;
+var MAX_LINE_CHARS = 220;
+var MAX_SNIPPET_CHARS = 80;
+var MAX_REGION_LINES = 6;
+var WORD = /[\w$]/;
+function regionSpan(line, pos) {
+  const start = Math.max(0, (pos.fromColumn ?? 1) - 1);
+  if (start >= line.length) return null;
+  const sameLine = pos.toLine == null || pos.toLine === pos.fromLine;
+  let end = sameLine && pos.toColumn != null ? Math.min(pos.toColumn - 1, line.length) : line.length;
+  if (end <= start) end = line.length;
+  while (end < line.length && WORD.test(line[end - 1]) && WORD.test(line[end])) end++;
+  return [start, end];
+}
+function snippetAt(lines, pos) {
+  if (pos.fromLine == null) return null;
+  const line = lines[pos.fromLine - 1];
+  if (line === void 0) return null;
+  const span = regionSpan(line, pos);
+  if (!span) return null;
+  const text = line.slice(span[0], span[1]).trim();
+  if (!text) return null;
+  return text.length > MAX_SNIPPET_CHARS ? `${text.slice(0, MAX_SNIPPET_CHARS - 1)}\u2026` : text;
+}
+function excerptLines(lineCount, focus) {
+  const wanted = [...new Set(focus)].filter((n) => n >= 1 && n <= lineCount).sort((a, b) => a - b);
+  for (const context of [2, 1, 0]) {
+    const show = /* @__PURE__ */ new Set();
+    for (const n of wanted) {
+      for (let k = n - context; k <= n + context; k++) if (k >= 1 && k <= lineCount) show.add(k);
+    }
+    if (show.size <= MAX_EXCERPT_LINES || context === 0) {
+      return [...show].sort((a, b) => a - b).slice(0, MAX_EXCERPT_LINES);
+    }
+  }
+  return [];
+}
+async function readLines(root, file) {
+  const clean2 = file.replace(/^\.\//, "");
+  if (!clean2 || isAbsolute(clean2)) return null;
+  const full = resolve(root, clean2);
+  const rel = relative(root, full);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+  try {
+    const info = await stat(full);
+    if (!info.isFile() || info.size > MAX_FILE_BYTES) return null;
+    const buf = await readFile2(full);
+    if (buf.subarray(0, 8e3).includes(0)) return null;
+    return buf.toString("utf8").split(/\r?\n/);
+  } catch {
+    return null;
+  }
+}
+function clip(line) {
+  return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS - 1)}\u2026` : line;
+}
+async function attachSourceContext(issues, root) {
+  const base = resolve(root);
+  const cache = /* @__PURE__ */ new Map();
+  const load = (file) => {
+    let p = cache.get(file);
+    if (!p) cache.set(file, p = readLines(base, file));
+    return p;
+  };
+  const out = [];
+  const missing = /* @__PURE__ */ new Set();
+  let enriched = 0;
+  for (const issue of issues) {
+    const flow = read(issue, "dataflow");
+    const fp = read(issue, "filePath");
+    const region = read(issue, "codeRegion");
+    const steps = flow.state === "present" ? flow.value : [];
+    const start = region.state === "present" ? region.value.startLine : null;
+    const primary = fp.state === "present" && start != null ? { file: fp.value, start } : null;
+    if (!steps.length && !primary) {
+      out.push(issue);
+      continue;
+    }
+    const focus = /* @__PURE__ */ new Map();
+    const addFocus = (file, n) => {
+      const list2 = focus.get(file) ?? [];
+      list2.push(n);
+      focus.set(file, list2);
+    };
+    const withSnippets = [];
+    for (const s of steps) {
+      const lines = await load(s.file);
+      if (!lines) missing.add(s.file);
+      const snippet = lines ? snippetAt(lines, s) : null;
+      withSnippets.push(snippet ? { ...s, snippet } : s);
+      if (s.fromLine != null) addFocus(s.file, s.fromLine);
+    }
+    if (primary && region.state === "present") {
+      const end = Math.min(region.value.endLine ?? primary.start, primary.start + MAX_REGION_LINES - 1);
+      for (let n = primary.start; n <= end; n++) addFocus(primary.file, n);
+    }
+    const excerpts = [];
+    for (const [file, lines] of focus) {
+      const text = await load(file);
+      if (!text) {
+        missing.add(file);
+        continue;
+      }
+      const show = excerptLines(text.length, lines);
+      if (show.length) excerpts.push({ file, lines: show.map((n) => ({ n, text: clip(text[n - 1] ?? "") })) });
+    }
+    const gotSnippet = withSnippets.some((s) => s.snippet);
+    if (!gotSnippet && !excerpts.length) {
+      out.push(issue);
+      continue;
+    }
+    enriched++;
+    out.push({
+      ...issue,
+      ...steps.length ? { dataflow: withSnippets } : {},
+      sourceExcerpt: excerpts.length ? excerpts : null
+    });
+  }
+  return { issues: out, enriched, missing: [...missing].sort() };
+}
+
 // snyk_report/lib/interactive.mts
-import { readdir, stat } from "node:fs/promises";
+import { readdir, stat as stat2 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join as join2, resolve as resolve2 } from "node:path";
 
 // snyk_report/lib/render/theme.mts
 var SEV = {
@@ -2690,8 +3244,8 @@ function nextLine() {
   const buffered = queued.shift();
   if (buffered !== void 0) return Promise.resolve(buffered);
   if (inputClosed) return Promise.reject(new InputClosedError());
-  return new Promise((resolve3, reject) => {
-    waiting = resolve3;
+  return new Promise((resolve4, reject) => {
+    waiting = resolve4;
     notifyClosed = () => {
       waiting = null;
       notifyClosed = null;
@@ -2710,7 +3264,7 @@ async function askSecret(question) {
   if (!isInteractive()) throw new Error("cannot prompt for a secret without a TTY");
   closePrompts();
   stderr.write(`${c.cyan("?")} ${question} `);
-  return new Promise((resolve3, reject) => {
+  return new Promise((resolve4, reject) => {
     let value = "";
     const wasRaw = stdin.isRaw ?? false;
     stdin.setRawMode(true);
@@ -2722,7 +3276,7 @@ async function askSecret(question) {
       stdin.pause();
       stderr.write("\n");
       if (err) reject(err);
-      else resolve3(value);
+      else resolve4(value);
     };
     const onData = (chunk) => {
       for (const ch of chunk) {
@@ -2929,13 +3483,13 @@ var list = (v) => {
   return parts.length ? parts : void 0;
 };
 var BACK_WORDS = /* @__PURE__ */ new Set(["back", "b", "list", "cancel", "q"]);
-async function askUntilResolved(question, resolve3) {
+async function askUntilResolved(question, resolve4) {
   for (let attempt = 0; attempt < 10; attempt++) {
     const answer = await ask(`${question} (or "back" for the list)`);
     if (!answer) continue;
     if (BACK_WORDS.has(answer.trim().toLowerCase())) return null;
     try {
-      return await resolve3(answer);
+      return await resolve4(answer);
     } catch (err) {
       log.warn(err instanceof Error ? err.message : String(err));
     }
@@ -3155,8 +3709,39 @@ async function selectSource() {
       value: "csv",
       label: "Use a CSV I already exported",
       hint: "Reports tab download, or a saved export"
+    },
+    {
+      value: "cli",
+      label: "Scan a local folder with the Snyk CLI",
+      hint: "snyk code test + snyk test; shows the code at every data-flow step"
     }
   ]);
+}
+async function askDirectory(question, fallback) {
+  for (; ; ) {
+    const answer = (await ask(question, fallback ?? void 0)).trim().replace(/^["']|["']$/g, "");
+    if (!answer) return fallback;
+    const path = resolve2(expandHome(answer));
+    try {
+      if ((await stat2(path)).isDirectory()) return path;
+      log.warn(`${path} is a file, not a folder`);
+    } catch {
+      log.warn(`no such folder: ${path}`);
+    }
+  }
+}
+async function askScanFolder() {
+  return await askDirectory("Folder to scan", process.cwd()) ?? process.cwd();
+}
+async function selectCliScans() {
+  return choose("Which scans?", [
+    { value: { code: true, openSource: true }, label: "Snyk Code and Open Source", hint: "both, side by side" },
+    { value: { code: true, openSource: false }, label: "Snyk Code only", hint: "snyk code test: SAST with data flow" },
+    { value: { code: false, openSource: true }, label: "Open Source only", hint: "snyk test --all-projects" }
+  ]);
+}
+async function askSourcePath() {
+  return askDirectory("Show the code at each data-flow step? Path to a local checkout (Enter to skip)", null);
 }
 function humanSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -3164,16 +3749,16 @@ function humanSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 function expandHome(p) {
-  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+  return p.startsWith("~/") ? join2(homedir(), p.slice(2)) : p;
 }
 async function findLocalCsvs() {
   try {
     const names = await readdir(process.cwd());
     const out = [];
     for (const name of names.filter((n) => /[.]csv([.]gz)?$/i.test(n)).slice(0, 20)) {
-      const path = resolve(name);
+      const path = resolve2(name);
       try {
-        const info = await stat(path);
+        const info = await stat2(path);
         if (info.isFile()) out.push({ path, name, size: humanSize(info.size) });
       } catch {
       }
@@ -3201,8 +3786,8 @@ async function askCsvPath() {
     const path = expandHome(answer.trim().replace(/^["']|["']$/g, ""));
     if (!path) continue;
     try {
-      const info = await stat(path);
-      if (info.isFile()) return resolve(path);
+      const info = await stat2(path);
+      if (info.isFile()) return resolve2(path);
       log.warn(`${path} is a directory, not a file`);
     } catch {
       log.warn(`no such file: ${path}`);
@@ -3622,6 +4207,49 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
 .fd-rem ol{margin:0;padding-left:17px;font-size:12px;line-height:1.5;color:${C.body};
     display:flex;flex-direction:column;gap:4px}
 
+/* ---- Snyk Code data flow and source excerpt --------------------------- */
+/* Modelled on the Snyk UI's own data-flow panel: steps grouped by file and
+   then by line, the code at each step, Source and Sink tagged, the sink row
+   boxed. Divs, not a table -- .card table rules would restyle a table here. */
+.fd-msg{margin:10px 0 0;font-size:12px;line-height:1.5;color:${C.body}}
+.df{margin-top:12px;border:1px solid ${C.line};border-radius:8px;background:${C.surface};
+    padding:10px 12px 8px}
+.df__h{font-size:13px;font-weight:700;margin-bottom:6px}
+.df__h span{font-weight:400;color:${C.subtle}}
+.df__file{margin-top:4px}
+.df__fh{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:5px 2px;
+    font-size:11.5px;color:${C.muted}}
+.df__fh b{color:${C.ink}}
+.df__row{display:grid;grid-template-columns:58px minmax(0,1fr) auto 50px;align-items:center;gap:10px;
+    margin-left:12px;padding:5px 8px;border-left:1px dashed #CFCFD4}
+.df__row--sink{border:1px solid #8E8E96;border-radius:6px;background:#fff;margin-left:4px}
+.df__pos{font-family:${FONT_MONO};font-size:10.5px;color:${C.subtle};text-align:right;
+    border-right:1px solid ${C.line};padding-right:8px}
+.df__row--sink .df__pos{font-weight:700;color:${C.ink}}
+.df__code{font-family:${FONT_MONO};font-size:11px;color:#2457C5;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+.df__row--sink .df__code{font-weight:700}
+.df__code--none{color:${C.subtle};font-family:inherit;font-style:italic}
+.df__tag{font-size:8.5px;letter-spacing:.06em;color:${C.subtle};border:1px solid #D8D8DA;
+    border-radius:4px;padding:1px 5px;background:${C.lineFaint}}
+.df__n{justify-self:end;font-size:10px;color:${C.muted};border:1px solid #D8D8DA;border-radius:999px;
+    padding:1px 7px;background:#fff;white-space:nowrap}
+.df__row--sink .df__n{background:#FCE9A6;border-color:#EBCF6B;color:${C.ink}}
+.src{margin-top:10px;border:1px solid ${C.line};border-radius:8px;overflow:hidden}
+.src__fh{padding:7px 12px;background:${C.surface};border-bottom:1px solid ${C.line};
+    font-family:${FONT_MONO};font-size:11px;color:${C.muted}}
+.src__fh b{color:${C.ink}}
+.src__l{display:grid;grid-template-columns:40px minmax(0,1fr) auto;font-family:${FONT_MONO};
+    font-size:10.5px;line-height:1.6}
+.src__l--hit{background:#FDF4E1}
+.src__n{color:#A0A0A8;text-align:right;padding-right:10px;user-select:none}
+.src__l--hit .src__n{color:${C.ink};font-weight:700}
+.src__c{white-space:pre-wrap;word-break:break-all;tab-size:2;padding-right:8px;color:${C.body}}
+.src__c mark{background:#FCE9A6;outline:1px solid #E3C55A;border-radius:2px;color:inherit}
+.src__s{padding:0 8px;font-size:9px;color:${C.muted};white-space:nowrap}
+.src__gap{font-family:${FONT_MONO};font-size:10px;color:#A0A0A8;background:${C.lineFaint};
+    padding:1px 0 1px 30px}
+
 /* ---- register controls (screen only) --------------------------------- */
 /* Two stacked rows: search plus dropdowns, then the toggle chips. Cramming
    all of it onto one line pushed the search box down to a stub. */
@@ -3917,8 +4545,8 @@ function execPage(ctx) {
           ${top.map((i) => {
     const where = locationShort(i);
     const proj = i.project?.name ?? "";
-    const tail = [proj, where].filter(Boolean).join(" \xB7 ");
-    return `<li><strong>${esc(i.title)}</strong>${tail ? ` \u2014 <span class="mono">${esc(tail)}</span>` : ""} <span class="muted">(${esc(SEV[i.severity].label)}, ${esc(productLabel(i.product))})</span></li>`;
+    const tail2 = [proj, where].filter(Boolean).join(" \xB7 ");
+    return `<li><strong>${esc(i.title)}</strong>${tail2 ? ` \u2014 <span class="mono">${esc(tail2)}</span>` : ""} <span class="muted">(${esc(SEV[i.severity].label)}, ${esc(productLabel(i.product))})</span></li>`;
   }).join("")}
         </ol></div>` : "";
   return page(
@@ -4459,12 +5087,12 @@ function packageBlock(ctx, i) {
        color:${c2.fg};border:1px solid ${c2.border}">${esc(kebabLabel(reach.value))}</span></div>`
     );
   }
-  const tail = [];
+  const tail2 = [];
   if (range.state === "present") {
-    tail.push(["Vulnerable range", `<span class="mono">${esc(range.value)}</span>`]);
+    tail2.push(["Vulnerable range", `<span class="mono">${esc(range.value)}</span>`]);
   }
   if (cvss.state === "present" && cvss.value.vector) {
-    tail.push([
+    tail2.push([
       "CVSS vector",
       `<span class="mono">${esc(cvss.value.vector)}</span> <span class="muted">(${esc(
         cvss.value.source
@@ -4475,8 +5103,8 @@ function packageBlock(ctx, i) {
     <div class="card__h">Affected package</div>
     <div class="fd-pkg" style="grid-template-columns:repeat(${cells.length},minmax(0,1fr))">
       ${cells.join("")}</div>
-    ${tail.length ? `<div style="border-top:1px solid ${C.lineSoft};padding:11px 13px">
-           ${kv(tail, "tight")}</div>` : ""}
+    ${tail2.length ? `<div style="border-top:1px solid ${C.lineSoft};padding:11px 13px">
+           ${kv(tail2, "tight")}</div>` : ""}
   </div>`;
 }
 function codeBlock(i) {
@@ -4493,28 +5121,117 @@ function codeBlock(i) {
   }
   const commit = read(i, "commitId");
   if (commit.state === "present") pairs.push(["Commit", `<span class="mono">${esc(commit.value)}</span>`]);
+  const msg = read(i, "message");
+  const msgHtml = msg.state === "present" ? `<p class="fd-msg">${esc(msg.value)}</p>` : "";
   const flow = read(i, "dataflow");
-  const flowHtml = flow.state === "present" ? dataflowList(flow.value) : "";
-  const note = flow.state === "present" ? "" : `<p style="margin:10px 0 0;font-size:11px;color:${C.subtle}">The source excerpt and traced data
+  const steps = flow.state === "present" ? flow.value : [];
+  const excerpt = read(i, "sourceExcerpt");
+  const excerptHtml = excerpt.state === "present" ? excerpt.value.map((x) => sourceExcerptBlock(x, steps, i)).join("") : "";
+  const hasCode = excerpt.state === "present" || steps.some((s) => s.snippet);
+  const note = !steps.length && !hasCode ? `<p style="margin:10px 0 0;font-size:11px;color:${C.subtle}">The source excerpt and traced data
       flow are shown in the Snyk UI; this data source does not carry them, so they cannot be
-      reproduced here.</p>`;
+      reproduced here.</p>` : !hasCode ? `<p style="margin:8px 0 0;font-size:11px;color:${C.subtle}">Snyk returns positions, not
+        code. Re-run with <span class="mono">--path</span> pointing at a checkout of this
+        repository to show the code at each step.</p>` : "";
   return `<div class="card avoid-break"><div class="card__h">Code location</div>
-    <div class="card__b">${kv(pairs, "tight")}${flowHtml}${note}</div></div>`;
+    <div class="card__b">${kv(pairs, "tight")}${msgHtml}${steps.length ? dataflowPanel(steps) : ""}${excerptHtml}${note}</div></div>`;
 }
-function dataflowList(steps) {
-  const rows = steps.map((s, idx) => {
-    const isEnd = idx === 0 || idx === steps.length - 1;
-    const loc = s.fromLine == null ? "" : `:${s.fromLine}${s.toLine != null && s.toLine !== s.fromLine ? `\u2013${s.toLine}` : ""}`;
-    return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;
-        border-bottom:1px dashed ${C.lineSoft}">
-        <span style="flex:0 0 18px;height:18px;border-radius:50%;display:flex;align-items:center;
-          justify-content:center;font-size:10px;font-weight:700;color:#fff;
-          background:${isEnd ? C.accent : C.subtle}">${idx + 1}</span>
-        <span class="mono" style="font-size:11px">${esc(s.file)}${esc(loc)}</span></div>`;
+function stepRuns(ns) {
+  const sorted = [...new Set(ns)].sort((a, b) => a - b);
+  const runs = [];
+  for (let k = 0; k < sorted.length; ) {
+    let j = k;
+    while (j + 1 < sorted.length && sorted[j + 1] === sorted[j] + 1) j++;
+    runs.push(j > k ? `${sorted[k]}\u2013${sorted[j]}` : String(sorted[k]));
+    k = j + 1;
+  }
+  return runs.join(", ");
+}
+function pathHtml(file) {
+  const cut = file.lastIndexOf("/") + 1;
+  return `${esc(file.slice(0, cut))}<b>${esc(file.slice(cut))}</b>`;
+}
+function dataflowPanel(steps) {
+  const files = new Set(steps.map((s) => s.file)).size;
+  const last = steps.length;
+  const sections = [];
+  steps.forEach((s, idx) => {
+    let sec = sections[sections.length - 1];
+    if (!sec || sec.file !== s.file) sections.push(sec = { file: s.file, rows: [], count: 0 });
+    sec.count++;
+    const row = sec.rows[sec.rows.length - 1];
+    if (row && row.line === s.fromLine) {
+      row.n.push(idx + 1);
+      if (s.snippet) row.snippets.push(s.snippet);
+    } else {
+      sec.rows.push({ line: s.fromLine, col: s.fromColumn, snippets: s.snippet ? [s.snippet] : [], n: [idx + 1] });
+    }
+  });
+  const body = sections.map((sec) => {
+    const rows = sec.rows.map((r) => {
+      const isSink = r.n.includes(last);
+      const isSource = r.n.includes(1);
+      const tags = [isSource ? "SOURCE" : "", isSink ? "SINK" : ""].filter(Boolean);
+      const pos = r.line == null ? "" : `${r.line}${r.col != null ? `:${r.col}` : ""}`;
+      const code = r.snippets.length ? `<span class="df__code">${esc(r.snippets.join(", "))}</span>` : '<span class="df__code df__code--none">code not available</span>';
+      return `<div class="df__row${isSink ? " df__row--sink" : ""}">
+            <span class="df__pos">${esc(pos)}</span>${code}
+            <span>${tags.map((t) => `<span class="df__tag">${t}</span>`).join(" ")}</span>
+            <span class="df__n">${esc(stepRuns(r.n))}</span></div>`;
+    }).join("");
+    return `<div class="df__file"><div class="df__fh"><span class="mono">${pathHtml(sec.file)}</span>
+        <span>${fmt(sec.count)} step${sec.count === 1 ? "" : "s"}</span></div>${rows}</div>`;
   }).join("");
-  return `<div style="margin-top:10px"><div class="lbl" style="margin-bottom:6px">
-      Source &rarr; Sink data flow (${steps.length} step${steps.length === 1 ? "" : "s"})</div>
-    ${rows}</div>`;
+  return `<div class="df avoid-break"><div class="df__h">Data flow
+      <span>\xB7 ${fmt(steps.length)} step${steps.length === 1 ? "" : "s"} in ${fmt(files)} file${files === 1 ? "" : "s"}</span></div>${body}</div>`;
+}
+function sourceExcerptBlock(x, steps, i) {
+  const region = read(i, "codeRegion");
+  const fp = read(i, "filePath");
+  const primary = region.state === "present" && fp.state === "present" && fp.value === x.file ? region.value : null;
+  let prev = 0;
+  const lines = x.lines.map((l) => {
+    const marks = [];
+    const here = [];
+    steps.forEach((s, idx) => {
+      if (s.file !== x.file || s.fromLine !== l.n) return;
+      here.push(idx + 1);
+      const span = regionSpan(l.text, s);
+      if (span) marks.push(span);
+    });
+    const inPrimary = primary?.startLine != null && l.n >= primary.startLine && l.n <= (primary.endLine ?? primary.startLine);
+    if (!steps.length && inPrimary) {
+      const span = regionSpan(l.text, {
+        fromLine: l.n,
+        fromColumn: l.n === primary.startLine ? primary.startColumn ?? 1 : 1,
+        toLine: l.n,
+        toColumn: l.n === primary.endLine ? primary.endColumn ?? null : null
+      });
+      if (span) marks.push(span);
+    }
+    const hit = here.length > 0 || !steps.length && inPrimary;
+    const gap = prev && l.n > prev + 1 ? '<div class="src__gap">\u22EF</div>' : "";
+    prev = l.n;
+    return `${gap}<div class="src__l${hit ? " src__l--hit" : ""}"><span class="src__n">${l.n}</span>
+        <span class="src__c">${markSpans(l.text, marks)}</span><span class="src__s">${here.length ? esc(stepRuns(here)) : ""}</span></div>`;
+  }).join("");
+  return `<div class="src avoid-break"><div class="src__fh">${pathHtml(x.file)}</div>${lines}</div>`;
+}
+function markSpans(text, spans) {
+  const merged = [];
+  for (const [a, b] of [...spans].sort((p, q) => p[0] - q[0])) {
+    const end = Math.min(b, text.length);
+    const top = merged[merged.length - 1];
+    if (top && a <= top[1]) top[1] = Math.max(top[1], end);
+    else if (a < end) merged.push([a, end]);
+  }
+  let out = "";
+  let at = 0;
+  for (const [a, b] of merged) {
+    out += `${esc(text.slice(at, a))}<mark>${esc(text.slice(a, b))}</mark>`;
+    at = b;
+  }
+  return out + esc(text.slice(at)) || " ";
 }
 function remediationBlock(ctx, i) {
   const steps = [];
@@ -4589,7 +5306,7 @@ function classificationBlock(i) {
     <div class="avoid-break"><div class="lbl">Classification</div>
       ${rows.length ? kv(rows, "narrow") : `<p class="muted" style="font-size:11.5px;margin:0">Not classified in this export.</p>`}</div>
     <div class="avoid-break"><div class="lbl">References</div>
-      ${refs.length ? `<ul>${refs.map((r) => `<li>${r}</li>`).join("")}</ul>` : `<p class="muted" style="font-size:11.5px;margin:0">This export carried no issue URL.</p>`}</div></div>`;
+      ${refs.length ? `<ul>${refs.map((r) => `<li>${r}</li>`).join("")}</ul>` : `<p class="muted" style="font-size:11.5px;margin:0">This data source carried no issue URL.</p>`}</div></div>`;
 }
 var GLOSSARY = [
   [
@@ -4884,8 +5601,8 @@ ${appendixPage(ctx)}
 }
 
 // snyk_report/lib/render/pdf.mts
-import { spawn } from "node:child_process";
-import { access, constants, stat as stat2, unlink } from "node:fs/promises";
+import { spawn as spawn2 } from "node:child_process";
+import { access, constants, stat as stat3, unlink } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 var CANDIDATES = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -4920,7 +5637,7 @@ async function findChrome() {
 var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
 async function sizeOf(path) {
   try {
-    return (await stat2(path)).size;
+    return (await stat3(path)).size;
   } catch {
     return 0;
   }
@@ -4936,7 +5653,7 @@ async function exportPdf(htmlPath, pdfPath, opts = {}) {
   await unlink(pdfPath).catch(() => {
   });
   const timeout = opts.timeoutMs ?? 3e5;
-  const child = spawn(
+  const child = spawn2(
     chrome,
     [
       "--headless=new",
@@ -5042,6 +5759,21 @@ Or read live results (Issues REST API) -- use this right after a scan:
                         computed fixability or deleted issues.
   --no-dataflow         skip Snyk Code data flows (smaller, faster responses)
 
+Or scan a local folder with the Snyk CLI, and report on that:
+  --from-cli            run "snyk code test" and "snyk test --all-projects" in
+                        --path, then build the report. Every Code finding gets
+                        its data flow with the actual code at each step.
+                        Uses the CLI's own login (snyk auth) or SNYK_TOKEN.
+  --path <dir>          folder to scan (default: the current folder). With any
+                        other source, a local checkout to read the code at each
+                        data-flow step from.
+  --product <list>      sast and/or sca: which of the two scans to run
+  --org <id|slug>       passed to the CLI as --org (default: the CLI's org)
+  --region <r>          sets the CLI's API region (default: the CLI's config)
+  --cli-results <list>  skip scanning; report on SARIF / snyk test --json files
+                        you already have, comma separated
+  --scan-timeout <m>    minutes each scan may take (default: 10)
+
 Or run a fresh Snyk Code scan directly and report on just that (also Tests
 v2 API; useful to target one repo without an Export API run first):
   --from-tests-api      run a new scan instead of reading an existing result
@@ -5079,6 +5811,9 @@ async function main() {
       "export-id": { type: "string" },
       "export-timeout": { type: "string", default: "30" },
       "from-issues-api": { type: "boolean", default: false },
+      "from-cli": { type: "boolean", default: false },
+      path: { type: "string" },
+      "cli-results": { type: "string" },
       "from-tests-api": { type: "boolean", default: false },
       "repo-url": { type: "string" },
       "integration-id": { type: "string" },
@@ -5124,6 +5859,19 @@ async function main() {
   }
   const useTestsApi = values["from-tests-api"];
   let useIssuesApi = values["from-issues-api"];
+  let useCli = values["from-cli"] || values["cli-results"] !== void 0;
+  if (useCli) {
+    const others = [
+      values.csv && "--csv",
+      values["from-api"] && "--from-api",
+      useIssuesApi && "--from-issues-api",
+      useTestsApi && "--from-tests-api"
+    ].filter(Boolean);
+    if (others.length) fail(`pass --from-cli on its own, not together with ${others.join(", ")}.`);
+    for (const f of ["group", "target", "project", "since", "export-id"]) {
+      if (values[f] !== void 0) fail(`--${f} does not apply to --from-cli, which scans --path.`);
+    }
+  }
   if (useIssuesApi && useTestsApi) fail("pass either --from-issues-api or --from-tests-api, not both.");
   if (useIssuesApi && (values["from-api"] || values.csv)) {
     fail("pass --from-issues-api on its own, not together with --csv or --from-api.");
@@ -5132,7 +5880,7 @@ async function main() {
     fail("--export-id re-attaches to an Export API job; it has no meaning with --from-issues-api.");
   }
   const apiFlags = ["region", "org", "group", "since", "export-id", "target"];
-  let useApi = !useTestsApi && !useIssuesApi && (values["from-api"] || apiFlags.some((f) => values[f] !== void 0));
+  let useApi = !useTestsApi && !useIssuesApi && !useCli && (values["from-api"] || apiFlags.some((f) => values[f] !== void 0));
   if (useTestsApi && (useApi || values.csv)) {
     fail("pass --from-tests-api on its own, not together with --csv or --from-api.");
   }
@@ -5147,15 +5895,16 @@ async function main() {
     fail("--from-tests-api needs --org <org_id> (the Tests API has no group scope).");
   }
   let csvPathFromPrompt;
-  if (!useApi && !useTestsApi && !useIssuesApi && !values.csv) {
+  if (!useApi && !useTestsApi && !useIssuesApi && !useCli && !values.csv) {
     if (!isInteractive()) {
       fail(
-        "nothing to report on. Pass --csv <file>, --from-api, --from-issues-api or --from-tests-api, or --help for usage."
+        "nothing to report on. Pass --csv <file>, --from-api, --from-issues-api, --from-cli or --from-tests-api, or --help for usage."
       );
     }
     const source = await selectSource();
     if (source === "api") useApi = true;
     else if (source === "issues-api") useIssuesApi = true;
+    else if (source === "cli") useCli = true;
     else csvPathFromPrompt = await askCsvPath();
   }
   if (useIssuesApi && values["include-deleted"]) {
@@ -5182,6 +5931,9 @@ async function main() {
   let formatSpec = values.format;
   let dataAsOf = null;
   let freshness = null;
+  let codeRoot = values.path ? resolve3(values.path) : null;
+  let productSpec = values.product;
+  let examinedTargetsFromSource;
   if (useApi || useIssuesApi) {
     const conn = await connect({ region: values.region, token: process.env["SNYK_TOKEN"] });
     regionLabel = conn.regionLabel;
@@ -5257,8 +6009,55 @@ async function main() {
     });
     sourceLabel = "Snyk Code Tests API (source\u2192sink dataflow)";
     sourceDetail = `${scopeLabel} - ${conn.regionLabel}`;
+  } else if (useCli) {
+    const dir = values.path ? resolve3(values.path) : isInteractive() && !values["cli-results"] ? await askScanFolder() : process.cwd();
+    codeRoot = dir;
+    scopeLabel = `Local folder ${basename2(dir)}`;
+    periodLabel = "point-in-time scan";
+    sourceLabel = "Snyk CLI scan";
+    sourceDetail = dir;
+    examinedTargetsFromSource = [basename2(dir)];
+    let apiUrl;
+    if (values.region) {
+      const url = resolveRegion(values.region);
+      if (!url) fail(`unknown --region ${values.region}. Use one of: ${REGIONS.map((r) => r.key).join(", ")}.`);
+      apiUrl = url;
+      regionLabel = describeRegion(url);
+    }
+    if (values["cli-results"]) {
+      const files = values["cli-results"].split(",").map((f) => resolve3(f.trim())).filter(Boolean);
+      log.step(`Reading ${files.length} CLI result file(s)`);
+      outcome = await ingestCliResults(files, { dir, org: values.org });
+    } else {
+      const wanted = parseProducts(values.product ?? "all");
+      let scans = {
+        code: wanted === "all" || wanted.includes("code"),
+        openSource: wanted === "all" || wanted.includes("open-source")
+      };
+      if (!values.product && isInteractive()) {
+        scans = await selectCliScans();
+        productSpec = [scans.code && "sast", scans.openSource && "sca"].filter(Boolean).join(",");
+      }
+      if (!scans.code && !scans.openSource) {
+        fail("--from-cli runs Snyk Code (sast) and Open Source (sca) scans; --product names neither.");
+      }
+      const run = await runCliScans({
+        dir,
+        code: scans.code,
+        openSource: scans.openSource,
+        org: values.org,
+        apiUrl,
+        timeoutMs: (Number(values["scan-timeout"]) || 10) * 6e4
+      });
+      try {
+        outcome = await ingestCliResults(run.files, { dir, ran: scans, org: values.org });
+      } finally {
+        await run.cleanup();
+      }
+      sourceLabel = `Snyk CLI ${run.version} scan`;
+    }
   } else {
-    const csvPath = csvPathFromPrompt ?? resolve2(values.csv);
+    const csvPath = csvPathFromPrompt ?? resolve3(values.csv);
     log.step(`Reading ${csvPath}`);
     outcome = await ingestCsvFile(csvPath, {
       source: "csv",
@@ -5266,6 +6065,19 @@ async function main() {
     });
     sourceLabel = "Snyk CSV export";
     sourceDetail = csvPath;
+  }
+  if (!codeRoot && isInteractive() && outcome.issues.some((i) => read(i, "dataflow").state === "present")) {
+    codeRoot = await askSourcePath();
+  }
+  if (codeRoot) {
+    const ctx = await attachSourceContext(outcome.issues, codeRoot);
+    outcome = { ...outcome, issues: ctx.issues };
+    if (ctx.enriched) log.dim(`code shown for ${fmt2(ctx.enriched)} finding(s) from ${codeRoot}`);
+    if (ctx.missing.length) {
+      log.warn(
+        `${fmt2(ctx.missing.length)} file(s) named by Snyk are not in ${codeRoot} (e.g. ${ctx.missing.slice(0, 3).join(", ")}); is it the same repository and commit?`
+      );
+    }
   }
   const { issues, summary } = outcome;
   const d = summary.dropped;
@@ -5294,7 +6106,7 @@ async function main() {
   const productTotals = /* @__PURE__ */ new Map();
   for (const i of issues) productTotals.set(i.product, (productTotals.get(i.product) ?? 0) + 1);
   const wantProducts = await selectProducts(
-    values.product,
+    productSpec,
     [...productTotals].map(([product, total]) => ({ product, total })).sort((a, b) => b.total - a.total)
   );
   let kept = issues;
@@ -5351,7 +6163,7 @@ async function main() {
       );
     }
   }
-  let examinedTargets = targetFilter;
+  let examinedTargets = targetFilter ?? examinedTargetsFromSource;
   if (!examinedTargets?.length && issues.length === 0 && apiClient && scopeOrgIds?.length === 1) {
     const found = await tryList("targets", () => listTargets(apiClient, scopeOrgIds[0]));
     if (found?.length) examinedTargets = found.map((t) => t.name);
@@ -5405,11 +6217,11 @@ async function main() {
   }
   let logo = null;
   if (values.logo) {
-    const p = resolve2(values.logo);
+    const p = resolve3(values.logo);
     const ext = p.slice(p.lastIndexOf(".") + 1).toLowerCase();
     const mime = ext === "svg" ? "image/svg+xml" : ext === "jpg" || ext === "jpeg" ? "image/jpeg" : `image/${ext}`;
     try {
-      logo = `data:${mime};base64,${(await readFile(p)).toString("base64")}`;
+      logo = `data:${mime};base64,${(await readFile3(p)).toString("base64")}`;
     } catch {
       fail(`could not read --logo ${p}`);
     }
@@ -5459,7 +6271,7 @@ async function main() {
     ...logo === null ? {} : { logo }
   };
   const chosenOut = values.out ?? (isInteractive() ? await askOutputPath("snyk-report") : "snyk-report");
-  const base = resolve2(chosenOut);
+  const base = resolve3(chosenOut);
   await mkdir(dirname(base), { recursive: true });
   const written = [];
   if (formats.has("html")) {
@@ -5483,7 +6295,7 @@ async function main() {
     else log.warn(r.reason ?? "PDF export failed");
     if (!wantHtml) {
       if (r.ok) {
-        await rm(`${base}.html`, { force: true });
+        await rm2(`${base}.html`, { force: true });
       } else {
         log.info(`HTML kept at ${base}.html \u2014 open it and print to PDF`);
         written.push(`${base}.html`);
