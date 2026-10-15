@@ -79,6 +79,22 @@ this mode destroys scan history.
   python3 snyk_delete_empty_targets.py --delete-targets                 # menu, preview
   python3 snyk_delete_empty_targets.py --org abhay --targets repo-a,repo-b --apply
   python3 snyk_delete_empty_targets.py --org abhay --targets-file gone.txt --apply
+
+DEACTIVATE MODE (keep the history, stop scanning)
+-------------------------------------------------
+Snyk has no "inactive" state for a target, only for projects. So marking a
+repository deactivated means deactivating every project under its target. The
+target, its issue history and its ignores are kept, and the projects can be
+reactivated from the Snyk UI. Selection works exactly as in bulk delete
+(numbers, names, or a file) and the same safety rules apply.
+
+  python3 snyk_delete_empty_targets.py --deactivate-targets             # menu, preview
+  python3 snyk_delete_empty_targets.py --org abhay --deactivate-targets \\
+        --targets repo-a,repo-b --apply
+  python3 snyk_delete_empty_targets.py --org abhay --deactivate-targets \\
+        --targets-file retired.txt --apply
+
+Projects that are already inactive are left alone and reported as such.
 """
 
 import argparse
@@ -289,7 +305,7 @@ def count_projects_for_target(org_id, target_id):
 
 
 def list_target_projects(org_id, target_id):
-    """[(project_id, name)] for one target, asked fresh. None if it cannot be
+    """[(project_id, name, status)] for one target, asked fresh. None if it cannot be
     established -- callers must treat that as "do not delete"."""
     try:
         rows = list(paginate(f"/rest/orgs/{org_id}/projects",
@@ -298,7 +314,8 @@ def list_target_projects(org_id, target_id):
     except (requests.HTTPError, requests.RequestException, RuntimeError) as e:
         log_warn(f"could not list projects for {target_id}: {e}")
         return None
-    return [(p["id"], attr(p.get("attributes", {}), "name", default=p["id"]))
+    return [(p["id"], attr(p.get("attributes", {}), "name", default=p["id"]),
+             attr(p.get("attributes", {}), "status", default="active"))
             for p in rows]
 
 
@@ -323,7 +340,7 @@ def delete_target_with_projects(org_id, target_id):
     projects = list_target_projects(org_id, target_id)
     if projects is None:
         return False, "could not list its projects"
-    for pid, pname in projects:
+    for pid, pname, _status in projects:
         ok, detail = delete_project(org_id, pid)
         if not ok:
             return False, f"project {pname}: {detail} (target kept)"
@@ -332,6 +349,52 @@ def delete_target_with_projects(org_id, target_id):
     if ok:
         detail = f"{detail} (+{len(projects)} project(s))"
     return ok, detail
+
+
+def deactivate_project(org_id, project_id):
+    """POST the v1 deactivate action for one project. Returns (ok, detail).
+
+    The REST API has no deactivate action, so this uses the v1 endpoint, which
+    takes plain JSON rather than JSON:API.
+    """
+    url = f"{API_BASE}/v1/org/{org_id}/project/{project_id}/deactivate"
+    hdrs = dict(headers(), **{"Content-Type": "application/json"})
+    for _ in range(5):
+        resp = requests.post(url, headers=hdrs, timeout=30)
+        if resp.status_code == 429:
+            time.sleep(int(resp.headers.get("Retry-After", 5)))
+            continue
+        if resp.status_code in (200, 202, 204):
+            return True, "deactivated"
+        if resp.status_code == 404:
+            return False, "project not found"
+        if resp.status_code in (401, 403):
+            return False, (f"HTTP {resp.status_code} -- the token cannot deactivate "
+                           "projects in this org; it needs org admin")
+        return False, f"HTTP {resp.status_code}: {resp.text[:140]}"
+    return False, "rate limited five times in a row"
+
+
+def deactivate_target_projects(org_id, target_id):
+    """Deactivate every active project under the target. Returns (ok, detail).
+
+    The target itself is untouched. Projects that are already inactive are
+    skipped, so a re-run after a partial failure picks up where it stopped.
+    """
+    projects = list_target_projects(org_id, target_id)
+    if projects is None:
+        return False, "could not list its projects"
+    if not projects:
+        return True, "no projects to deactivate"
+    active = [(pid, pname) for pid, pname, status in projects if status != "inactive"]
+    if not active:
+        return True, f"already inactive ({len(projects)} project(s))"
+    for pid, pname in active:
+        ok, detail = deactivate_project(org_id, pid)
+        if not ok:
+            return False, f"project {pname}: {detail}"
+        time.sleep(DELETE_DELAY)
+    return True, f"deactivated {len(active)} project(s)"
 
 
 def _delete(url):
@@ -708,7 +771,7 @@ def report_resolution(unmatched, ambiguous):
                  "use the full name or the target id")
 
 
-def select_for_bulk(found, args):
+def select_for_bulk(found, args, verb="Delete"):
     """Choose targets by number, name or file. Never offers 'all'."""
     step("Select")
 
@@ -722,11 +785,11 @@ def select_for_bulk(found, args):
         item("Requested", f"{len(names)} name(s) from the command line", cyan)
     else:
         if args.yes or not sys.stdin.isatty():
-            sys.exit("Bulk delete needs --targets or --targets-file when run "
-                     "unattended. It will not delete everything by default.")
+            sys.exit(f"Bulk {verb.lower()} needs --targets or --targets-file when run "
+                     f"unattended. It will not {verb.lower()} everything by default.")
         print(dim("   numbers (1,4,7-9), names (repo-a,owner/repo-b), "
                   "or file:/path/to/list.txt"), file=sys.stderr)
-        ans = ask("  Delete which? [or n to cancel]: ")
+        ans = ask(f"  {verb} which? [or n to cancel]: ")
         if ans.lower() in ("", "n", "no", "q", "cancel"):
             log("Cancelled -- nothing selected.")
             return []
@@ -754,12 +817,21 @@ def select_for_bulk(found, args):
     return chosen
 
 
-def run_bulk(found, orgs, args, group_name):
-    """Selection, preview, confirmation and deletion for bulk mode."""
+def run_bulk(found, orgs, args, group_name, mode="delete"):
+    """Selection, preview, confirmation and action for bulk mode.
+
+    mode is "delete" (targets and their projects) or "deactivate" (projects
+    only; targets and history kept).
+    """
+    deactivate = mode == "deactivate"
+    verb = "Deactivate" if deactivate else "Delete"
+    word = verb.upper()
+    act = deactivate_target_projects if deactivate else None
+
     item("Targets", len(found), yellow)
     show_table(found, multi_org=len(orgs) > 1, show_projects=True)
 
-    chosen = select_for_bulk(found, args)
+    chosen = select_for_bulk(found, args, verb)
     outcomes = {}
     if not chosen:
         if args.csv:
@@ -769,21 +841,22 @@ def run_bulk(found, orgs, args, group_name):
     if len(chosen) > args.max_deletes:
         log_fail(f"{len(chosen)} targets selected but --max-deletes is "
                  f"{args.max_deletes}. Raise it deliberately if that many really "
-                 "should go.")
+                 f"should be {verb.lower()}d.")
         if args.csv:
             write_csv(args.csv, found, outcomes)
         sys.exit(1)
 
     total_projects = sum(r["projects"] for r in chosen)
-    step("Delete" if args.apply else "Delete (dry run)")
+    step(verb if args.apply else f"{verb} (dry run)")
 
     if not args.apply:
-        log("Dry run -- nothing will be deleted. Re-run with --apply to act.")
+        log(f"Dry run -- nothing will be {verb.lower()}d. Re-run with --apply to act.")
         for r in chosen:
-            item("would delete", f"{r['name']}  {dim(str(r['projects']) + ' project(s)')}")
-            outcomes[r["target_id"]] = "would delete (dry run)"
+            item(f"would {verb.lower()}",
+                 f"{r['name']}  {dim(str(r['projects']) + ' project(s)')}")
+            outcomes[r["target_id"]] = f"would {verb.lower()} (dry run)"
         item("Total", f"{len(chosen)} target(s), {total_projects} project(s) "
-                      "would be deleted", yellow)
+                      f"would be {verb.lower()}d", yellow)
         if args.csv:
             write_csv(args.csv, found, outcomes)
         return
@@ -795,22 +868,30 @@ def run_bulk(found, orgs, args, group_name):
                      f"{yellow(str(r['projects']) + ' project(s)')}")
         if len(chosen) > 20:
             item("", dim(f"... and {len(chosen) - 20} more"))
-        log_warn(f"About to permanently delete {len(chosen)} target(s) and "
-                 f"{total_projects} project(s), including their issue history, "
-                 "ignores and settings. This cannot be undone.")
-        if ask("  Type DELETE to confirm: ") != "DELETE":
-            log("Not confirmed -- nothing deleted.")
+        if deactivate:
+            log_warn(f"About to deactivate the projects of {len(chosen)} target(s) "
+                     f"({total_projects} project(s)). Scanning stops; history is "
+                     "kept and they can be reactivated in the Snyk UI.")
+        else:
+            log_warn(f"About to permanently delete {len(chosen)} target(s) and "
+                     f"{total_projects} project(s), including their issue history, "
+                     "ignores and settings. This cannot be undone.")
+        if ask(f"  Type {word} to confirm: ") != word:
+            log(f"Not confirmed -- nothing {verb.lower()}d.")
             if args.csv:
                 write_csv(args.csv, found, outcomes)
             return
 
-    deleted = errors = 0
+    done = errors = 0
     for r in chosen:
-        ok, detail = delete_target_with_projects(r["org_id"], r["target_id"])
+        if deactivate:
+            ok, detail = act(r["org_id"], r["target_id"])
+        else:
+            ok, detail = delete_target_with_projects(r["org_id"], r["target_id"])
         if ok:
             log_ok(f"{r['name']}  {dim(r['target_id'])}  {detail}")
             outcomes[r["target_id"]] = detail
-            deleted += 1
+            done += 1
         else:
             log_fail(f"{r['name']}: {detail}")
             outcomes[r["target_id"]] = f"failed: {detail}"
@@ -819,7 +900,7 @@ def run_bulk(found, orgs, args, group_name):
 
     print(file=sys.stderr)
     item("Group", group_name)
-    item("Deleted", deleted, green if deleted else None)
+    item(f"{verb}d", done, green if done else None)
     item("Failed", errors, red if errors else None)
     if args.csv:
         write_csv(args.csv, found, outcomes)
@@ -828,18 +909,24 @@ def run_bulk(found, orgs, args, group_name):
 
 
 def choose_mode(args):
-    """True for bulk delete. Flags decide; otherwise ask when interactive."""
+    """None for empty-target cleanup, else "delete" or "deactivate".
+
+    Flags decide; otherwise ask when interactive.
+    """
+    if args.deactivate_targets:
+        return "deactivate"
     if args.delete_targets or args.targets or args.targets_file:
-        return True
+        return "delete"
     if args.yes or not sys.stdin.isatty():
-        return False
+        return None
     print(f"\n{bold(cyan('> MODE'))}", file=sys.stderr)
     item("[1] Clean up empty targets", dim("targets with zero projects"))
     item("[2] Bulk delete targets", dim("chosen targets AND their projects"))
-    ans = ask("  Which mode? [1-2, default 1, or n to cancel]: ")
+    item("[3] Deactivate targets", dim("chosen targets' projects; history kept"))
+    ans = ask("  Which mode? [1-3, default 1, or n to cancel]: ")
     if ans.lower() == "n":
         sys.exit("Cancelled.")
-    return ans == "2"
+    return {"2": "delete", "3": "deactivate"}.get(ans)
 
 
 # ---------------------------------------------------------------------------
@@ -886,12 +973,17 @@ def parse_args():
                    help=f"refuse to delete more than this in one run (default {DEFAULT_MAX_DELETES})")
     p.add_argument("--delete-targets", action="store_true",
                    help="bulk delete mode: remove chosen targets AND their projects")
+    p.add_argument("--deactivate-targets", action="store_true",
+                   help="deactivate every project under the chosen targets instead "
+                        "of deleting (history kept). Use with --targets / "
+                        "--targets-file, or pick from the menu")
     p.add_argument("--targets", default="",
-                   help="bulk delete: comma-separated repo/target names or ids "
+                   help="bulk delete/deactivate: comma-separated repo/target names or ids "
                         "(implies --delete-targets)")
     p.add_argument("--targets-file", default="",
-                   help="bulk delete: file with one repo/target name or id per "
-                        "line (implies --delete-targets)")
+                   help="bulk delete/deactivate: file with one repo/target name or id "
+                        "per line (implies --delete-targets unless "
+                        "--deactivate-targets is given)")
     p.add_argument("--csv", default="",
                    help="write the full findings, and what happened to each, here")
     return p.parse_args()
@@ -905,7 +997,8 @@ def main():
 
     scheme = detect_auth_scheme()
     log(f"Authenticated against {API_BASE} ({scheme} scheme)")
-    bulk = choose_mode(args)
+    mode = choose_mode(args)
+    bulk = mode is not None
 
     group_id, group_name = choose_group(args.group)
     orgs = choose_orgs(group_id, args.org, args.all_orgs)
@@ -931,14 +1024,14 @@ def main():
                  "Empty targets in them are missing from this report.")
 
     if not found:
-        log_ok("No targets found. Nothing to delete." if bulk
+        log_ok("No targets found. Nothing to act on." if bulk
                else "No empty targets found. Nothing to clean up.")
         if args.csv:
             write_csv(args.csv, [], {})
         return
 
     if bulk:
-        run_bulk(found, orgs, args, group_name)
+        run_bulk(found, orgs, args, group_name, mode)
         return
 
     item("Empty targets", len(found), yellow)
