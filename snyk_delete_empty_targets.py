@@ -59,6 +59,26 @@ USAGE
 
   # unattended: deletes every empty target found, no prompts
   python3 snyk_delete_empty_targets.py --group <id> --all-orgs --apply --yes
+
+BULK DELETE MODE (targets that DO have projects)
+------------------------------------------------
+Deletes chosen targets together with every project under them. Pick it from the
+menu at start-up, or pass --delete-targets / --targets / --targets-file.
+
+  * By number from the on-screen list:   1,4,7-9
+  * By name, comma separated:            my-repo,owner/other-repo
+  * By file (one name or target id per line, # comments allowed):
+                                         file:/path/to/list.txt
+  * A single repo is just a list of one.
+
+A name matches the full target name ('owner/repo'), the repo part alone
+('repo'), or a target id. A name that matches more than one target is skipped
+and reported -- use the full name or the id. 'all' is deliberately not offered:
+this mode destroys scan history.
+
+  python3 snyk_delete_empty_targets.py --delete-targets                 # menu, preview
+  python3 snyk_delete_empty_targets.py --org abhay --targets repo-a,repo-b --apply
+  python3 snyk_delete_empty_targets.py --org abhay --targets-file gone.txt --apply
 """
 
 import argparse
@@ -268,9 +288,53 @@ def count_projects_for_target(org_id, target_id):
     return len(body.get("data", []))
 
 
+def list_target_projects(org_id, target_id):
+    """[(project_id, name)] for one target, asked fresh. None if it cannot be
+    established -- callers must treat that as "do not delete"."""
+    try:
+        rows = list(paginate(f"/rest/orgs/{org_id}/projects",
+                             {"version": API_VERSION, "limit": 100,
+                              "target_id": target_id}))
+    except (requests.HTTPError, requests.RequestException, RuntimeError) as e:
+        log_warn(f"could not list projects for {target_id}: {e}")
+        return None
+    return [(p["id"], attr(p.get("attributes", {}), "name", default=p["id"]))
+            for p in rows]
+
+
+def delete_project(org_id, project_id):
+    """DELETE one project. Returns (ok, detail)."""
+    return _delete(f"{API_BASE}/rest/orgs/{org_id}/projects/{project_id}")
+
+
 def delete_target(org_id, target_id):
     """DELETE one target. Returns (ok, detail)."""
-    url = f"{API_BASE}/rest/orgs/{org_id}/targets/{target_id}"
+    return _delete(f"{API_BASE}/rest/orgs/{org_id}/targets/{target_id}")
+
+
+def delete_target_with_projects(org_id, target_id):
+    """Delete every project under the target, then the target itself.
+
+    Projects go first, explicitly, rather than trusting the target delete to
+    cascade: if any project cannot be removed the target is left alone, so a
+    failure never leaves a half-deleted state hidden behind a 'deleted' line.
+    Returns (ok, detail).
+    """
+    projects = list_target_projects(org_id, target_id)
+    if projects is None:
+        return False, "could not list its projects"
+    for pid, pname in projects:
+        ok, detail = delete_project(org_id, pid)
+        if not ok:
+            return False, f"project {pname}: {detail} (target kept)"
+        time.sleep(DELETE_DELAY)
+    ok, detail = delete_target(org_id, target_id)
+    if ok:
+        detail = f"{detail} (+{len(projects)} project(s))"
+    return ok, detail
+
+
+def _delete(url):
     for _ in range(5):
         resp = requests.delete(url, headers=headers(),
                                params={"version": API_VERSION}, timeout=30)
@@ -322,8 +386,9 @@ def fmt_age(hours):
     return f"{hours / 24:.0f}d"
 
 
-def scan_org(org_id, org_name, name_filter, excludes):
-    """Every target in one org that has no projects at all.
+def scan_org(org_id, org_name, name_filter, excludes, empty_only=True):
+    """Every target in one org that has no projects at all (or, with
+    empty_only=False, every target, for bulk delete).
 
     Both listings are pulled in full and joined locally rather than asking per
     target: one org with 2,000 targets is 20 target pages plus 20 project pages,
@@ -344,7 +409,7 @@ def scan_org(org_id, org_name, name_filter, excludes):
     found = []
     for t in targets:
         tid = t.get("id")
-        if counts.get(tid):
+        if empty_only and counts.get(tid):
             continue
         a = t.get("attributes", {})
         name = attr(a, "display_name", "displayName", "name", default=tid)
@@ -359,6 +424,7 @@ def scan_org(org_id, org_name, name_filter, excludes):
             "target_id": tid,
             "name": name,
             "origin": attr(a, "origin", default="?"),
+            "projects": counts.get(tid, 0),
             "url": attr(a, "url", "remote_url", "remoteUrl"),
             "created": created,
             "age_h": age_hours(created),
@@ -470,7 +536,7 @@ def choose_orgs(group_id, preset, all_orgs):
     sys.exit("Cancelled.")
 
 
-def show_table(found, multi_org):
+def show_table(found, multi_org, show_projects=False):
     """The report. One line per empty target, numbered for selection."""
     # Widths follow the data but never shrink below their own headings,
     # otherwise a run where every repo name is short prints a skewed table.
@@ -482,15 +548,20 @@ def show_table(found, multi_org):
     if multi_org:
         header += f"{'ORG':<{org_w}}  "
     header += f"{'ORIGIN':<10}  {'AGE':>5}"
+    if show_projects:
+        header += f"  {'PROJECTS':>8}"
     print(f"\n{bold(header)}", file=sys.stderr)
     print(dim("   " + "-" * (len(header) - 3)), file=sys.stderr)
 
     for n, r in enumerate(found, 1):
-        recent = r["age_h"] is not None and r["age_h"] < RECENT_HOURS
+        recent = (not show_projects and r["age_h"] is not None
+                  and r["age_h"] < RECENT_HOURS)
         line = f"   {n:>4}  {r['name'][:width]:<{width}}  "
         if multi_org:
             line += f"{r['org_name'][:org_w]:<{org_w}}  "
         line += f"{str(r['origin'])[:10]:<10}  {fmt_age(r['age_h']):>5}"
+        if show_projects:
+            line += f"  {r.get('projects', 0):>8}"
         if recent:
             line += yellow("  <- new, import may still be running")
         print(line, file=sys.stderr)
@@ -588,24 +659,209 @@ def confirm(chosen, args):
 
 
 # ---------------------------------------------------------------------------
+# Bulk delete mode
+# ---------------------------------------------------------------------------
+
+def read_name_file(path):
+    """One name or target id per line; blanks and '#' comments ignored."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh]
+    except OSError as e:
+        sys.exit(f"Cannot read {path}: {e}")
+    return [ln for ln in lines if ln and not ln.startswith("#")]
+
+
+def resolve_names(names, found):
+    """Match user-supplied names/ids to scanned targets.
+
+    Returns (rows, unmatched, ambiguous). A name matching several targets
+    (the same repo in two orgs, or 'repo' under two owners) is NOT guessed at:
+    it is reported so the user can pass the full name or the id.
+    """
+    rows, unmatched, ambiguous, seen = [], [], [], set()
+    for raw in names:
+        key = norm(raw)
+        hits = [r for r in found
+                if r["target_id"] == raw.strip() or norm(r["name"]) == key]
+        if not hits:
+            hits = [r for r in found
+                    if norm(r["name"]).rsplit("/", 1)[-1] == key]
+        if not hits:
+            unmatched.append(raw)
+        elif len(hits) > 1:
+            ambiguous.append((raw, hits))
+        else:
+            r = hits[0]
+            if r["target_id"] not in seen:
+                seen.add(r["target_id"])
+                rows.append(r)
+    return rows, unmatched, ambiguous
+
+
+def report_resolution(unmatched, ambiguous):
+    for raw in unmatched:
+        log_warn(f"no target matches {raw!r} -- skipped")
+    for raw, hits in ambiguous:
+        where = ", ".join(f"{h['name']} [{h['org_name']}]" for h in hits[:4])
+        log_warn(f"{raw!r} is ambiguous ({len(hits)} matches: {where}) -- skipped; "
+                 "use the full name or the target id")
+
+
+def select_for_bulk(found, args):
+    """Choose targets by number, name or file. Never offers 'all'."""
+    step("Select")
+
+    names = []
+    if args.targets:
+        names += [x.strip() for x in args.targets.split(",") if x.strip()]
+    if args.targets_file:
+        names += read_name_file(args.targets_file)
+
+    if names:
+        item("Requested", f"{len(names)} name(s) from the command line", cyan)
+    else:
+        if args.yes or not sys.stdin.isatty():
+            sys.exit("Bulk delete needs --targets or --targets-file when run "
+                     "unattended. It will not delete everything by default.")
+        print(dim("   numbers (1,4,7-9), names (repo-a,owner/repo-b), "
+                  "or file:/path/to/list.txt"), file=sys.stderr)
+        ans = ask("  Delete which? [or n to cancel]: ")
+        if ans.lower() in ("", "n", "no", "q", "cancel"):
+            log("Cancelled -- nothing selected.")
+            return []
+        if ans.lower().startswith("file:"):
+            names = read_name_file(ans[5:].strip())
+        else:
+            picked_rows, names = [], []
+            for part in (x.strip() for x in ans.split(",")):
+                if not part:
+                    continue
+                idx = parse_selection(part, len(found))
+                if idx is not None and part.replace("-", "").isdigit():
+                    picked_rows += [found[i - 1] for i in idx]
+                else:
+                    names.append(part)
+            if names:
+                more, unmatched, ambiguous = resolve_names(names, found)
+                report_resolution(unmatched, ambiguous)
+                picked_rows += more
+            return list({r["target_id"]: r for r in picked_rows}.values())
+
+    chosen, unmatched, ambiguous = resolve_names(names, found)
+    report_resolution(unmatched, ambiguous)
+    item("Selected", f"{len(chosen)} target(s)", cyan)
+    return chosen
+
+
+def run_bulk(found, orgs, args, group_name):
+    """Selection, preview, confirmation and deletion for bulk mode."""
+    item("Targets", len(found), yellow)
+    show_table(found, multi_org=len(orgs) > 1, show_projects=True)
+
+    chosen = select_for_bulk(found, args)
+    outcomes = {}
+    if not chosen:
+        if args.csv:
+            write_csv(args.csv, found, outcomes)
+        return
+
+    if len(chosen) > args.max_deletes:
+        log_fail(f"{len(chosen)} targets selected but --max-deletes is "
+                 f"{args.max_deletes}. Raise it deliberately if that many really "
+                 "should go.")
+        if args.csv:
+            write_csv(args.csv, found, outcomes)
+        sys.exit(1)
+
+    total_projects = sum(r["projects"] for r in chosen)
+    step("Delete" if args.apply else "Delete (dry run)")
+
+    if not args.apply:
+        log("Dry run -- nothing will be deleted. Re-run with --apply to act.")
+        for r in chosen:
+            item("would delete", f"{r['name']}  {dim(str(r['projects']) + ' project(s)')}")
+            outcomes[r["target_id"]] = "would delete (dry run)"
+        item("Total", f"{len(chosen)} target(s), {total_projects} project(s) "
+                      "would be deleted", yellow)
+        if args.csv:
+            write_csv(args.csv, found, outcomes)
+        return
+
+    if not args.yes:
+        print(file=sys.stderr)
+        for r in chosen[:20]:
+            item("", f"{r['name']}  {dim(r['org_name'])}  "
+                     f"{yellow(str(r['projects']) + ' project(s)')}")
+        if len(chosen) > 20:
+            item("", dim(f"... and {len(chosen) - 20} more"))
+        log_warn(f"About to permanently delete {len(chosen)} target(s) and "
+                 f"{total_projects} project(s), including their issue history, "
+                 "ignores and settings. This cannot be undone.")
+        if ask("  Type DELETE to confirm: ") != "DELETE":
+            log("Not confirmed -- nothing deleted.")
+            if args.csv:
+                write_csv(args.csv, found, outcomes)
+            return
+
+    deleted = errors = 0
+    for r in chosen:
+        ok, detail = delete_target_with_projects(r["org_id"], r["target_id"])
+        if ok:
+            log_ok(f"{r['name']}  {dim(r['target_id'])}  {detail}")
+            outcomes[r["target_id"]] = detail
+            deleted += 1
+        else:
+            log_fail(f"{r['name']}: {detail}")
+            outcomes[r["target_id"]] = f"failed: {detail}"
+            errors += 1
+        time.sleep(DELETE_DELAY)
+
+    print(file=sys.stderr)
+    item("Group", group_name)
+    item("Deleted", deleted, green if deleted else None)
+    item("Failed", errors, red if errors else None)
+    if args.csv:
+        write_csv(args.csv, found, outcomes)
+    if errors:
+        sys.exit(1)
+
+
+def choose_mode(args):
+    """True for bulk delete. Flags decide; otherwise ask when interactive."""
+    if args.delete_targets or args.targets or args.targets_file:
+        return True
+    if args.yes or not sys.stdin.isatty():
+        return False
+    print(f"\n{bold(cyan('> MODE'))}", file=sys.stderr)
+    item("[1] Clean up empty targets", dim("targets with zero projects"))
+    item("[2] Bulk delete targets", dim("chosen targets AND their projects"))
+    ans = ask("  Which mode? [1-2, default 1, or n to cancel]: ")
+    if ans.lower() == "n":
+        sys.exit("Cancelled.")
+    return ans == "2"
+
+
+# ---------------------------------------------------------------------------
 
 def write_csv(path, found, outcomes):
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["org_name", "org_id", "target_name", "target_id", "origin",
-                    "url", "created_at", "age", "outcome"])
+                    "url", "created_at", "age", "projects", "outcome"])
         for r in found:
             w.writerow([
                 r["org_name"], r["org_id"], r["name"], r["target_id"], r["origin"],
                 r["url"], r["created"].isoformat() if r["created"] else "",
-                fmt_age(r["age_h"]), outcomes.get(r["target_id"], "not selected"),
+                fmt_age(r["age_h"]), r.get("projects", 0), outcomes.get(r["target_id"], "not selected"),
             ])
     log_ok(f"CSV written to {path}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Find and delete Snyk targets that hold zero projects.",
+        description="Find and delete Snyk targets that hold zero projects, or bulk "
+                    "delete chosen targets with their projects.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Dry run by default -- nothing is deleted without --apply.")
     p.add_argument("--group", default=os.environ.get("SNYK_GROUP_ID", ""),
@@ -628,6 +884,14 @@ def parse_args():
                         "selections (they are usually imports still running)")
     p.add_argument("--max-deletes", type=int, default=DEFAULT_MAX_DELETES,
                    help=f"refuse to delete more than this in one run (default {DEFAULT_MAX_DELETES})")
+    p.add_argument("--delete-targets", action="store_true",
+                   help="bulk delete mode: remove chosen targets AND their projects")
+    p.add_argument("--targets", default="",
+                   help="bulk delete: comma-separated repo/target names or ids "
+                        "(implies --delete-targets)")
+    p.add_argument("--targets-file", default="",
+                   help="bulk delete: file with one repo/target name or id per "
+                        "line (implies --delete-targets)")
     p.add_argument("--csv", default="",
                    help="write the full findings, and what happened to each, here")
     return p.parse_args()
@@ -641,19 +905,21 @@ def main():
 
     scheme = detect_auth_scheme()
     log(f"Authenticated against {API_BASE} ({scheme} scheme)")
+    bulk = choose_mode(args)
 
     group_id, group_name = choose_group(args.group)
     orgs = choose_orgs(group_id, args.org, args.all_orgs)
 
     # --- scan ---------------------------------------------------------------
-    step("Scan for empty targets")
+    step("Scan for targets" if bulk else "Scan for empty targets")
     found, failed = [], []
     for org_id, org_name in orgs:
         # A token can enumerate a group's orgs without being able to read inside
         # every one, and Snyk answers 404 (not 403) for an org it will not show
         # you. Skip that org rather than losing the whole run.
         try:
-            found.extend(scan_org(org_id, org_name, args.filter, excludes))
+            found.extend(scan_org(org_id, org_name, args.filter, excludes,
+                                   empty_only=not bulk))
         except (requests.HTTPError, RuntimeError) as e:
             code = getattr(getattr(e, "response", None), "status_code", "?")
             log_fail(f"{org_name}: SKIPPED (HTTP {code}) -- the token cannot read "
@@ -665,9 +931,14 @@ def main():
                  "Empty targets in them are missing from this report.")
 
     if not found:
-        log_ok("No empty targets found. Nothing to clean up.")
+        log_ok("No targets found. Nothing to delete." if bulk
+               else "No empty targets found. Nothing to clean up.")
         if args.csv:
             write_csv(args.csv, [], {})
+        return
+
+    if bulk:
+        run_bulk(found, orgs, args, group_name)
         return
 
     item("Empty targets", len(found), yellow)
