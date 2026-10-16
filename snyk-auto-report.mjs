@@ -1360,6 +1360,31 @@ var SnykClient = class {
     });
   }
   /**
+   * Any method, returning the raw response instead of throwing on a non-2xx.
+   *
+   * The v1 API is a different service from REST: it wants plain
+   * application/json, and has no `version` parameter. Sending it the JSON:API
+   * content type that `post()` uses can leave the body unparsed, so the
+   * format is chosen from the path.
+   */
+  async send(method, path, body) {
+    const url = new URL(path.startsWith("http") ? path : `${this.baseUrl}${path}`);
+    const isV1 = url.pathname.startsWith("/v1/") || url.pathname.startsWith("/api/v1/");
+    if (!isV1 && !url.searchParams.has("version")) url.searchParams.set("version", REST_VERSION);
+    const init = {
+      method,
+      headers: this.#headers(isV1 ? "application/json" : "application/vnd.api+json")
+    };
+    if (body !== void 0) init.body = JSON.stringify(body);
+    return request(url.toString(), init);
+  }
+  async put(path, body) {
+    return this.send("PUT", path, body);
+  }
+  async patch(path, body) {
+    return this.send("PATCH", path, body);
+  }
+  /**
    * Follow every page of a cursor-paginated collection.
    *
    * Four independent termination guards, because no single one is sufficient
@@ -1641,16 +1666,32 @@ var SINCE_CHOICES = [
   { value: "14d", label: "Last 14 days" },
   { value: "30d", label: "Last 30 days" },
   { value: "90d", label: "Last 90 days" },
+  { value: "180d", label: "Last 6 months" },
+  { value: "365d", label: "Last 365 days" },
+  { value: "2y", label: "Last 2 years" },
   { value: "all", label: "All time" }
 ];
-function sinceToFilters(preset) {
-  if (preset === "all") return { introducedFrom: "1970-01-01T00:00:00Z" };
-  const days = Number(preset.replace("d", ""));
-  const from = new Date(Date.now() - days * 864e5);
-  return { introducedFrom: `${from.toISOString().slice(0, 19)}Z` };
+var DATE = /^\d{4}-\d{2}-\d{2}$/;
+function isIsoDate(value) {
+  if (!DATE.test(value)) return false;
+  const d = /* @__PURE__ */ new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
-function describeSince(preset) {
-  return SINCE_CHOICES.find((c2) => c2.value === preset)?.label ?? preset;
+function sinceToFilters(since, until) {
+  let introducedFrom;
+  if (since === "all") introducedFrom = "1970-01-01T00:00:00Z";
+  else if (DATE.test(since)) introducedFrom = `${since}T00:00:00Z`;
+  else {
+    const days = since === "2y" ? 730 : Number(since.replace("d", ""));
+    const from = new Date(Date.now() - days * 864e5);
+    introducedFrom = `${from.toISOString().slice(0, 19)}Z`;
+  }
+  return until ? { introducedFrom, introducedTo: `${until}T23:59:59Z` } : { introducedFrom };
+}
+function describeSince(since, until) {
+  const start = DATE.test(since) ? `Since ${since}` : SINCE_CHOICES.find((c2) => c2.value === since)?.label ?? since;
+  if (!until) return start;
+  return since === "all" ? `Up to ${until}` : DATE.test(since) ? `${since} to ${until}` : `${start}, up to ${until}`;
 }
 
 // snyk_report/lib/normalize/rest-issue.mts
@@ -1843,6 +1884,10 @@ function normalizeRestIssue(raw, ctx) {
       ranges.push(...strings(r.meta.data?.semver_vulnerable));
     }
   }
+  const remedyText = uniq(
+    coords.flatMap((c2) => (c2.remedies ?? []).map((r) => (r.description ?? "").trim()))
+  );
+  issue.remediationText = remedyText.length ? remedyText.join("\n\n") : null;
   issue.fixedInVersion = uniq(fixedIn).join(", ") || null;
   issue.semverVulnerableRange = uniq(ranges).join(", ") || null;
   const upstream = coords.map((c2) => c2.is_fixable_upstream).filter((v) => typeof v === "boolean");
@@ -1851,6 +1896,7 @@ function normalizeRestIssue(raw, ctx) {
   if (reach.length) observed.add("reachability");
   const mapped = new Set(reach.map((r) => REACHABILITY[r]).filter((r) => Boolean(r)));
   issue.reachability = REACH_RANK.find((r) => mapped.has(r)) ?? null;
+  issue.description = (a.description ?? "").trim() || null;
   issue.firstIntroduced = parseSnykTimestamp(a.created_at);
   issue.updatedAt = parseSnykTimestamp(a.updated_at);
   issue.lastIntroduced = latest(coords.map((c2) => c2.last_introduced_at));
@@ -1920,7 +1966,9 @@ var CARRIED = [
   "updatedAt",
   "lastIntroduced",
   "vulnDbUrl",
-  "issueType"
+  "issueType",
+  "description",
+  "remediationText"
 ];
 var UNOBSERVED_NOTE = {
   score: "No issue in this run came back with a risk score; risk scoring may not be enabled for this tenant.",
@@ -1934,7 +1982,7 @@ function restIssueAvailability(observed, notes = {}) {
   return makeAvailability("issues-rest", [
     ...CARRIED.map(carried),
     ...OBSERVABLE_FIELDS.map(
-      (k) => observed.has(k) ? carried(k) : absent(k, notes[open sn k] ?? UNOBSERVED_NOTE[k])
+      (k) => observed.has(k) ? carried(k) : absent(k, notes[k] ?? UNOBSERVED_NOTE[k])
     ),
     ...ABSENT.map(([k, note]) => absent(k, note))
   ]);
@@ -3005,6 +3053,106 @@ async function attachSourceContext(issues, root) {
   return { issues: out, enriched, missing: [...missing].sort() };
 }
 
+// snyk_report/lib/ingest/enrich-details.mts
+var FIELDS = ["description", "remediationText", "dataflow", "message"];
+function sameLocation(a, b) {
+  const fa = read(a, "filePath");
+  const fb = read(b, "filePath");
+  if (fa.state !== "present" || fb.state !== "present") return true;
+  if (fa.value !== fb.value) return false;
+  const ra = read(a, "codeRegion");
+  const rb = read(b, "codeRegion");
+  if (ra.state !== "present" || rb.state !== "present") return true;
+  return ra.value.startLine === rb.value.startLine;
+}
+function missingFrom(target, live) {
+  const out = {};
+  for (const k of FIELDS) {
+    if (read(target, k).state === "present") continue;
+    const v = read(live, k);
+    if (v.state === "present") out[k] = v.value;
+  }
+  return out;
+}
+function matchLive(target, candidates) {
+  const same = candidates.filter((c2) => c2.problemId === target.problemId && sameLocation(target, c2));
+  if (same.length === 1) return same[0];
+  if (same.length > 1) {
+    const pkg = read(target, "packageNameAndVersion");
+    if (pkg.state === "present") {
+      const byPkg = same.filter((c2) => {
+        const p = read(c2, "packageNameAndVersion");
+        return p.state === "present" && p.value === pkg.value;
+      });
+      if (byPkg.length === 1) return byPkg[0];
+    }
+  }
+  return null;
+}
+async function enrichIssueDetails(client, targets, all, opts) {
+  const groups = /* @__PURE__ */ new Map();
+  let unmatchable = 0;
+  for (const issue of targets) {
+    const projectId = issue.project?.id;
+    if (!projectId || !issue.org.id || issue.org.id === "unknown" || !issue.problemId) {
+      unmatchable++;
+      continue;
+    }
+    const key2 = `${issue.org.id}/${projectId}`;
+    const g = groups.get(key2) ?? { orgId: issue.org.id, projectId, issues: [] };
+    g.issues.push(issue);
+    groups.set(key2, g);
+  }
+  const additions = /* @__PURE__ */ new Map();
+  const failedProjects = [];
+  let unmatched = 0;
+  let done = 0;
+  for (const g of groups.values()) {
+    done++;
+    let live = [];
+    try {
+      const params = {
+        limit: "100",
+        "scan_item.id": validId(g.projectId, "project id"),
+        "scan_item.type": "project"
+      };
+      if (opts.includeCodeFlows) params["include_code_flows"] = "true";
+      const ctx = { org: { id: g.orgId, name: null }, group: null, project: null };
+      for await (const raw of client.paginate(
+        `/rest/orgs/${validId(g.orgId, "org id")}/issues`,
+        params
+      )) {
+        const r = normalizeRestIssue(raw, ctx);
+        if (r.ok) live.push(r.issue);
+      }
+    } catch (err) {
+      failedProjects.push(g.projectId);
+      log.dim(
+        `detail lookup failed for project ${g.projectId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      live = [];
+    }
+    if (done % 10 === 0) log.dim(`detail lookup: ${done}/${groups.size} project(s)`);
+    for (const issue of g.issues) {
+      const hit = matchLive(issue, live);
+      if (!hit) {
+        unmatched++;
+        continue;
+      }
+      const add = missingFrom(issue, hit);
+      if (Object.keys(add).length) additions.set(issue.issueKey, add);
+    }
+  }
+  let enriched = 0;
+  const issues = all.map((i) => {
+    const add = additions.get(i.issueKey);
+    if (!add) return i;
+    enriched++;
+    return { ...i, ...add };
+  });
+  return { issues, enriched, unmatchable, unmatched, failedProjects };
+}
+
 // snyk_report/lib/interactive.mts
 import { readdir, stat as stat2 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -3637,8 +3785,12 @@ async function selectScope(conn, opts) {
 async function selectSince(preset) {
   if (preset) {
     const value = preset.trim().toLowerCase();
+    if (isIsoDate(value)) {
+      if (value > (/* @__PURE__ */ new Date()).toISOString().slice(0, 10)) throw new Error(`--since ${preset} is in the future.`);
+      return value;
+    }
     if (!SINCE_CHOICES.some((c2) => c2.value === value)) {
-      throw new Error(`unknown --since ${preset}. Use 7d, 14d, 30d, 90d or all.`);
+      throw new Error(`unknown --since ${preset}. Use 7d, 14d, 30d, 90d, 180d, 365d, 2y, all or a date (YYYY-MM-DD).`);
     }
     return value;
   }
@@ -4207,6 +4359,28 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
 .fd-rem ol{margin:0;padding-left:17px;font-size:12px;line-height:1.5;color:${C.body};
     display:flex;flex-direction:column;gap:4px}
 
+/* ---- Snyk's markdown write-ups: Details and remediation advice --------- */
+/* Flows across pages on purpose: a write-up can be longer than a page, and an
+   avoid-break box that tall would be pushed whole onto the next one. */
+.fd-desc{margin:0 0 3mm}
+.md{font-size:11.5px;line-height:1.6;color:${C.body}}
+.md-src{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:${C.subtle};margin-bottom:4px}
+.md-p{margin:0 0 7px}
+.md-h{margin:11px 0 5px;font-size:12.5px;font-weight:700;color:${C.ink};break-after:avoid}
+.md code{font-family:${FONT_MONO};font-size:10.5px;background:${C.surface};
+    border:1px solid ${C.lineSoft};border-radius:4px;padding:0 4px}
+.md-list{margin:0 0 7px;padding-left:18px}
+.md-list li{margin:2px 0}
+.md-pre{margin:0 0 8px;padding:8px 10px;font-family:${FONT_MONO};font-size:10.5px;line-height:1.5;
+    background:${C.surface};border:1px solid ${C.lineSoft};border-radius:6px;white-space:pre-wrap;
+    overflow-wrap:anywhere;break-inside:avoid}
+.md-table{width:100%;border-collapse:collapse;margin:0 0 8px;font-size:10.5px;line-height:1.5}
+.md-table th{background:${C.surface};text-align:left;font-size:9.5px;letter-spacing:.06em;
+    text-transform:uppercase;color:${C.subtle}}
+.md-table th,.md-table td{border:1px solid ${C.lineSoft};padding:5px 7px;vertical-align:top}
+.md-table tr{break-inside:avoid}
+.md a{color:inherit;text-decoration:underline}
+
 /* ---- Snyk Code data flow and source excerpt --------------------------- */
 /* Modelled on the Snyk UI's own data-flow panel: steps grouped by file and
    then by line, the code at each step, Source and Sink tagged, the sink row
@@ -4314,6 +4488,100 @@ th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
   p,li{orphans:3;widows:3}
 }
 `;
+
+// snyk_report/lib/render/markdown.mts
+var SAFE_URL = /^(https?:\/\/|mailto:)/i;
+function inline(escaped) {
+  const codes = [];
+  let s = escaped.replace(/`([^`]+)`/g, (_m, c2) => {
+    codes.push(`<code>${c2}</code>`);
+    return `\0${codes.length - 1}\0`;
+  });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[\s(])\*([^*\s][^*]*)\*(?=[\s).,;:]|$)/g, "$1<i>$2</i>");
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, text, href) => {
+    const raw = href.replace(/&amp;/g, "&");
+    return SAFE_URL.test(raw) ? `<a href="${esc(raw)}">${text}</a>` : `${text} (${href})`;
+  });
+  return s.replace(/\u0000(\d+)\u0000/g, (_m, n) => codes[Number(n)] ?? "");
+}
+var cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c2) => c2.trim());
+var isTableSep = (line) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line);
+function markdownToHtml(md) {
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+    if (/^\s*```/.test(line)) {
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) body.push(lines[i++]);
+      i++;
+      out.push(`<pre class="md-pre">${esc(body.join("\n"))}</pre>`);
+      continue;
+    }
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) {
+      const level = Math.min(4, h[1].length + 1);
+      out.push(`<h${level} class="md-h">${inline(esc(h[2].trim()))}</h${level}>`);
+      i++;
+      continue;
+    }
+    if (line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const head = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(cells(lines[i++]));
+      out.push(
+        `<table class="md-table"><thead><tr>${head.map((c2) => `<th>${inline(esc(c2))}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${head.map((_h, k) => `<td>${inline(esc(r[k] ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody></table>`
+      );
+      continue;
+    }
+    const li = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    if (li) {
+      const ordered = /\d/.test(li[1]);
+      const items = [];
+      while (i < lines.length) {
+        const m = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(lines[i]);
+        if (!m || /\d/.test(m[1]) !== ordered) break;
+        items.push(m[2]);
+        i++;
+      }
+      const tag = ordered ? "ol" : "ul";
+      out.push(`<${tag} class="md-list">${items.map((t) => `<li>${inline(esc(t))}</li>`).join("")}</${tag}>`);
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !/^\s*```/.test(lines[i]) && !/^#{1,6}\s/.test(lines[i]) && !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i]) && !(lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]))) {
+      para.push(lines[i++].trim());
+    }
+    out.push(`<p class="md-p">${inline(esc(para.join(" ")))}</p>`);
+  }
+  return out.join("");
+}
+var REMEDIATION_HEADING = /^(remediation|how to (fix|prevent|remediate|mitigate)|fix(es|ing)?( guidance| advice)?|mitigations?|prevent(ion|ing)?|recommendations?)\b/i;
+function splitWriteup(md, preamble) {
+  const out = { details: [], remediation: [] };
+  let bucket = preamble;
+  let fenced = false;
+  for (const line of md.replace(/\r\n?/g, "\n").split("\n")) {
+    if (/^\s*```/.test(line)) fenced = !fenced;
+    const h = fenced ? null : /^(#{1,3})\s+(.*?)\s*#*\s*$/.exec(line);
+    if (h) {
+      const title = h[2].trim();
+      bucket = REMEDIATION_HEADING.test(title) ? "remediation" : "details";
+      const redundant = bucket === "details" ? /^details?$/i : /^remediation$/i;
+      if (redundant.test(title)) continue;
+    }
+    out[bucket].push(line);
+  }
+  return { details: out.details.join("\n").trim(), remediation: out.remediation.join("\n").trim() };
+}
 
 // snyk_report/lib/render/html.mts
 function listOf(items) {
@@ -5017,6 +5285,7 @@ function findingPage(ctx, i, n) {
       ${metricHtml}</div>
   </div>
   ${attributesBlock(ctx, i)}
+  ${descriptionBlock(i)}
   ${packageBlock(ctx, i)}
   ${codeBlock(i)}
   ${remediationBlock(ctx, i)}
@@ -5071,18 +5340,18 @@ function packageBlock(ctx, i) {
   const direct = read(i, "existsInDirectDependency");
   const range = read(i, "semverVulnerableRange");
   const cvss = read(i, "cvss");
-  const cells = [
+  const cells2 = [
     `<div><div class="k">Package</div><div class="v">${esc(pkg.value)}</div></div>`,
     `<div><div class="k">Fixed in</div><div class="v" style="color:${C.successDeep}">${fixed.state === "present" ? esc(fixed.value) : '<span class="faint">not stated</span>'}</div></div>`
   ];
   if (direct.state === "present") {
-    cells.push(
+    cells2.push(
       `<div><div class="k">Dependency</div><div class="v">${direct.value ? "Direct" : "Transitive"}</div></div>`
     );
   }
   if (reach.state === "present") {
     const c2 = reachChip(reach.value);
-    cells.push(
+    cells2.push(
       `<div><div class="k">Reachability</div><span class="reach" style="background:${c2.bg};
        color:${c2.fg};border:1px solid ${c2.border}">${esc(kebabLabel(reach.value))}</span></div>`
     );
@@ -5101,11 +5370,28 @@ function packageBlock(ctx, i) {
   }
   return `<div class="card avoid-break">
     <div class="card__h">Affected package</div>
-    <div class="fd-pkg" style="grid-template-columns:repeat(${cells.length},minmax(0,1fr))">
-      ${cells.join("")}</div>
+    <div class="fd-pkg" style="grid-template-columns:repeat(${cells2.length},minmax(0,1fr))">
+      ${cells2.join("")}</div>
     ${tail2.length ? `<div style="border-top:1px solid ${C.lineSoft};padding:11px 13px">
            ${kv(tail2, "tight")}</div>` : ""}
   </div>`;
+}
+function descriptionBlock(i) {
+  const body = sortedWriteup(i).details;
+  if (!body) return "";
+  return `<div class="fd-desc"><div class="lbl">Details</div>
+    <div class="md">${markdownToHtml(body)}</div></div>`;
+}
+function sortedWriteup(i) {
+  const d = read(i, "description");
+  const r = read(i, "remediationText");
+  const fromD = d.state === "present" ? splitWriteup(d.value, "details") : { details: "", remediation: "" };
+  const fromR = r.state === "present" ? splitWriteup(r.value, "remediation") : { details: "", remediation: "" };
+  const join3 = (...parts) => parts.filter(Boolean).join("\n\n");
+  return {
+    details: join3(fromD.details, fromR.details),
+    remediation: join3(fromR.remediation, fromD.remediation)
+  };
 }
 function codeBlock(i) {
   const fp = read(i, "filePath");
@@ -5265,11 +5551,13 @@ function remediationBlock(ctx, i) {
   if (url.state === "present") {
     steps.push(`Triage or ignore this finding in Snyk: <a href="${esc(url.value)}">open the issue</a>.`);
   }
-  if (!steps.length) return "";
+  const advice = sortedWriteup(i).remediation;
+  const snykHtml = advice ? `<div class="md" style="margin-top:8px"><div class="md-src">Snyk's remediation advice</div>${markdownToHtml(advice)}</div>` : "";
+  if (!steps.length && !snykHtml) return "";
   return `<div class="fd-rem" style="margin-bottom:2.5mm">
     <div class="lbl">Remediation</div>
-    <div class="note note--good avoid-break" style="padding:10px 12px">
-      <ol>${steps.map((s) => `<li>${s}</li>`).join("")}</ol></div></div>`;
+    <div class="note note--good" style="padding:10px 12px">
+      ${steps.length ? `<ol>${steps.map((s) => `<li>${s}</li>`).join("")}</ol>` : ""}${snykHtml}</div></div>`;
 }
 function classificationBlock(i) {
   const cwe = read(i, "cwe");
@@ -5738,7 +6026,9 @@ Pull straight from the Snyk API instead of a file:
   --target <list>       target names, comma separated. Each is checked against
                         the organisation; any miss fails the run.
   --project <list>      project names, filtered after download
-  --since <p>           7d | 14d | 30d | 90d | all   (the API requires a period)
+  --since <p>           7d | 14d | 30d | 90d | 180d | 365d | 2y | all, or a start
+                        date YYYY-MM-DD   (the API requires a period)
+  --until <date>        end date YYYY-MM-DD, inclusive (Export API only)
   --severity <list>     critical,high,medium,low or all
   --product <list>      sca,sast,container,iac,secrets or all
                         (which scanners to include; asked for interactively)
@@ -5758,6 +6048,11 @@ Or read live results (Issues REST API) -- use this right after a scan:
                         Snyk Code data flows; does not carry EPSS, CISA KEV,
                         computed fixability or deleted issues.
   --no-dataflow         skip Snyk Code data flows (smaller, faster responses)
+  --no-details          do not fetch Snyk's description, remediation advice and
+                        code flow for the findings that get a detail page. By
+                        default, with an API token, they are read back from the
+                        Issues API (one request per project) because the CSV
+                        and Export API carry none of that text.
 
 Or scan a local folder with the Snyk CLI, and report on that:
   --from-cli            run "snyk code test" and "snyk test --all-projects" in
@@ -5806,6 +6101,7 @@ async function main() {
       target: { type: "string" },
       project: { type: "string" },
       since: { type: "string" },
+      until: { type: "string" },
       severity: { type: "string" },
       product: { type: "string" },
       "export-id": { type: "string" },
@@ -5824,6 +6120,7 @@ async function main() {
       "test-id": { type: "string" },
       "scan-timeout": { type: "string", default: "10" },
       "no-dataflow": { type: "boolean", default: false },
+      "no-details": { type: "boolean", default: false },
       // No parseArgs defaults for options that gate an interactive question.
       // A default is indistinguishable from the user having typed the value,
       // so the guard `!values.x` is never true and the prompt is dead code.
@@ -5868,7 +6165,7 @@ async function main() {
       useTestsApi && "--from-tests-api"
     ].filter(Boolean);
     if (others.length) fail(`pass --from-cli on its own, not together with ${others.join(", ")}.`);
-    for (const f of ["group", "target", "project", "since", "export-id"]) {
+    for (const f of ["group", "target", "project", "since", "until", "export-id"]) {
       if (values[f] !== void 0) fail(`--${f} does not apply to --from-cli, which scans --path.`);
     }
   }
@@ -5876,10 +6173,14 @@ async function main() {
   if (useIssuesApi && (values["from-api"] || values.csv)) {
     fail("pass --from-issues-api on its own, not together with --csv or --from-api.");
   }
+  if (values.until !== void 0) {
+    if (!isIsoDate(values.until)) fail(`--until ${values.until} is not a date. Use YYYY-MM-DD.`);
+    if (useIssuesApi) fail("--until applies to the Export API only; the Issues API has no end-date filter.");
+  }
   if (useIssuesApi && values["export-id"]) {
     fail("--export-id re-attaches to an Export API job; it has no meaning with --from-issues-api.");
   }
-  const apiFlags = ["region", "org", "group", "since", "export-id", "target"];
+  const apiFlags = ["region", "org", "group", "since", "until", "export-id", "target"];
   let useApi = !useTestsApi && !useIssuesApi && !useCli && (values["from-api"] || apiFlags.some((f) => values[f] !== void 0));
   if (useTestsApi && (useApi || values.csv)) {
     fail("pass --from-tests-api on its own, not together with --csv or --from-api.");
@@ -5949,7 +6250,11 @@ async function main() {
     targetFilter = selection.targetNames;
     scopeOrgIds = selection.orgIds ?? (selection.scope.kind === "orgs" ? [selection.scope.id] : void 0);
     const since = await selectSince(values.since);
-    periodLabel = describeSince(since);
+    const until = values.until;
+    if (until && since !== "all" && /^\d{4}-/.test(since) && until < since) {
+      fail(`--until ${until} is before --since ${since}.`);
+    }
+    periodLabel = describeSince(since, until);
     sourceDetail = `${selection.scope.label} - ${conn.regionLabel}`;
     if (useIssuesApi) {
       log.step(`Reading live issues for ${selection.scope.label}`);
@@ -5969,7 +6274,7 @@ async function main() {
       })}`;
     } else {
       const filters = {
-        ...sinceToFilters(since),
+        ...sinceToFilters(since, until),
         ...selection.orgIds ? { orgs: selection.orgIds } : {},
         ...selection.targetNames ? { targetDisplayNames: selection.targetNames } : {}
       };
@@ -5987,7 +6292,7 @@ async function main() {
         orgIds: selection.orgIds,
         targetNames: selection.targetNames,
         exported: outcome.issues,
-        allTime: since === "all"
+        allTime: since === "all" && !until
       });
     }
   } else if (useTestsApi) {
@@ -6190,10 +6495,33 @@ async function main() {
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }
-  const data = buildReport(kept, summary.availability, {
+  const reportOpts = {
     topN,
     ...maxDetail === void 0 ? {} : { maxDetailRows: maxDetail }
-  });
+  };
+  let data = buildReport(kept, summary.availability, reportOpts);
+  if (apiClient && !values["no-details"] && data.topRisks.length) {
+    const lacking = data.topRisks.filter(
+      (i) => read(i, "description").state !== "present" || read(i, "remediationText").state !== "present"
+    );
+    if (lacking.length) {
+      log.step(`Fetching Snyk's description and remediation for ${fmt2(lacking.length)} detail page(s)`);
+      try {
+        const enr = await enrichIssueDetails(apiClient, lacking, kept, {
+          includeCodeFlows: !values["no-dataflow"]
+        });
+        if (enr.enriched) {
+          kept = enr.issues;
+          data = buildReport(kept, summary.availability, reportOpts);
+        }
+        log.info(
+          `details: ${fmt2(enr.enriched)} of ${fmt2(lacking.length)} finding(s) enriched` + (enr.unmatched ? `; ${fmt2(enr.unmatched)} had no single matching live issue` : "") + (enr.unmatchable ? `; ${fmt2(enr.unmatchable)} had no project or problem id to match on` : "") + (enr.failedProjects.length ? `; ${fmt2(enr.failedProjects.length)} project lookup(s) failed` : "")
+        );
+      } catch (err) {
+        log.warn(`could not fetch issue details: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
   if (formats.has("pdf") && data.topRisks.length > 250) {
     log.warn(
       `${fmt2(data.topRisks.length)} detail pages requested. That is roughly ${fmt2(data.topRisks.length)} PDF pages and can take many minutes to render. Lower --top, or drop pdf from --format and use the scrollable HTML.`
