@@ -101,9 +101,10 @@ import argparse
 import csv
 import fnmatch
 import os
+import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -423,14 +424,34 @@ def norm(name):
     return (name or "").strip().lower()
 
 
+_TS_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?"
+    r"(Z|[+-]\d{2}:?\d{2})?$")
+
+
 def parse_ts(value):
-    """Snyk timestamps are RFC3339 with a trailing Z, which fromisoformat only
-    learned to parse in 3.11. Swap it for +00:00 so older interpreters work too.
+    """Parse a Snyk RFC3339 timestamp without datetime.fromisoformat.
+
+    fromisoformat only exists from Python 3.7 (and only accepts a trailing Z
+    from 3.11), and plenty of servers still run python3 as 3.6. Parsing by hand
+    works on every version. Returns an aware UTC-based datetime, or None if the
+    value is missing or unparseable -- a bad timestamp must not stop a run.
     """
     if not value:
         return None
+    m = _TS_RE.match(str(value).strip())
+    if not m:
+        return None
+    year, month, day, hour, minute, sec, frac, tz = m.groups()
+    micro = int((frac or "0")[:6].ljust(6, "0"))
+    offset = timedelta(0)
+    if tz and tz != "Z":
+        sign = -1 if tz[0] == "-" else 1
+        digits = tz[1:].replace(":", "")
+        offset = sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return datetime(int(year), int(month), int(day), int(hour), int(minute),
+                        int(sec), micro, tzinfo=timezone(offset))
     except ValueError:
         return None
 
