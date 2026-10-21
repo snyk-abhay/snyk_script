@@ -1,0 +1,1290 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Snyk Credit Meter</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: an instrument panel. Contract setup strip → the meter (score + projection bar) → burn charts → breakdown tabs → method. */
+:root{
+  --bg:#F4F5FA; --surface:#FFFFFF; --sunk:#EEF0F7; --ink:#14172A; --muted:#5B6180; --line:#DFE2EE;
+  --accent:#4C44DB; --accent-soft:#EAE9FD; --on-accent:#FFFFFF;
+  --good:#12804A; --good-soft:#E3F4EA; --warn:#A66300; --warn-soft:#FBF0DC; --crit:#BF3520; --crit-soft:#FBE6E2; --info:#3657C9; --info-soft:#E6ECFB;
+  --c-opensource:#2563EB; --c-code:#8B3FD9; --c-container:#0E8A8C; --c-iac:#7F8DF0; --c-secrets:#D07A06; --c-aispm:#D23A7E; --c-apiweb:#C2410C; --c-agent:#4B5568; --c-pentest:#9A6B00;
+  --f-display:"Bricolage Grotesque", "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  --f-body:"IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --f-mono:"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --r:10px;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0E1020; --surface:#161931; --sunk:#1C2040; --ink:#E7E9F7; --muted:#9BA1C2; --line:#2A2F52;
+  --accent:#8F89FF; --accent-soft:#272556; --on-accent:#0E1020;
+  --good:#40D18C; --good-soft:#123326; --warn:#F2B451; --warn-soft:#3A2B10; --crit:#FF7B67; --crit-soft:#3D1A15; --info:#86A2FF; --info-soft:#1C2850;
+  --c-opensource:#5F93F5; --c-code:#B582F4; --c-container:#2CBDB9; --c-iac:#A3AEFF; --c-secrets:#F0A73A; --c-aispm:#F06BA8; --c-apiweb:#F57B45; --c-agent:#94A0B8; --c-pentest:#E3B23C;
+  color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0E1020; --surface:#161931; --sunk:#1C2040; --ink:#E7E9F7; --muted:#9BA1C2; --line:#2A2F52;
+  --accent:#8F89FF; --accent-soft:#272556; --on-accent:#0E1020;
+  --good:#40D18C; --good-soft:#123326; --warn:#F2B451; --warn-soft:#3A2B10; --crit:#FF7B67; --crit-soft:#3D1A15; --info:#86A2FF; --info-soft:#1C2850;
+  --c-opensource:#5F93F5; --c-code:#B582F4; --c-container:#2CBDB9; --c-iac:#A3AEFF; --c-secrets:#F0A73A; --c-aispm:#F06BA8; --c-apiweb:#F57B45; --c-agent:#94A0B8; --c-pentest:#E3B23C;
+  color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:14px;line-height:1.5}
+.wrap{width:100%;margin:0;padding-left:max(24px, env(safe-area-inset-left, 0px));padding-right:max(24px, env(safe-area-inset-right, 0px));padding-block:20px 48px;display:flex;flex-direction:column;gap:20px}
+h1,h2,h3{font-family:var(--f-display);font-weight:700;margin:0;text-wrap:balance;letter-spacing:-.01em}
+h1{font-size:26px} h2{font-size:19px} h3{font-size:15px;font-family:var(--f-body);font-weight:600;letter-spacing:0}
+.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
+.muted{color:var(--muted)} .mono{font-family:var(--f-mono)} .num{font-variant-numeric:tabular-nums}
+a{color:var(--accent)}
+button,select,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:7px 12px;cursor:pointer;font-weight:500;white-space:nowrap}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.seg-ctl{display:inline-flex;border:1px solid var(--line);background:var(--sunk);border-radius:8px;padding:2px;gap:2px}
+.seg-ctl button{display:inline-flex;align-items:center;gap:5px;border:0;background:none;padding:5px 10px;border-radius:6px;cursor:pointer;color:var(--muted);font-weight:500;font-size:13px}
+.seg-ctl button:hover{color:var(--ink)}
+.seg-ctl button[aria-checked="true"]{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px color-mix(in srgb, var(--ink) 18%, transparent)}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:18px}
+/* header */
+.top{display:flex;flex-wrap:nowrap;align-items:center;justify-content:space-between;gap:20px}
+.brand{display:flex;align-items:center;gap:12px;min-width:0;flex:1 1 auto}
+.brand svg{flex:none}
+.brand p{margin:2px 0 0;color:var(--muted)}
+.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;flex:none;margin-left:auto}
+@media (max-width:1100px){.top{flex-wrap:wrap}.actions{margin-left:0;justify-content:flex-start}}
+/* setup */
+.setup{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,2fr);gap:16px}
+.drop{border:1.5px dashed var(--line);border-radius:var(--r);padding:18px;display:flex;flex-direction:column;gap:8px;justify-content:center;background:var(--sunk);cursor:pointer;min-width:0}
+.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+.drop strong{font-size:15px}
+.drop .files{font-size:12px;color:var(--muted);word-break:break-all}
+.progress{height:4px;background:var(--line);border-radius:4px;overflow:hidden}
+.progress i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+.fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;align-content:start}
+.field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.field label{font-size:12px;color:var(--muted);font-weight:500}
+.field input,.field select{border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:7px 9px;width:100%;min-width:0}
+.field.wide{grid-column:span 2}
+.banner{display:block;border-radius:8px;padding:10px 14px;font-size:13px}
+.banner.sample{background:var(--warn-soft);color:var(--ink);border:1px solid color-mix(in srgb, var(--warn) 35%, transparent)}
+.banner.err{background:var(--crit-soft);border:1px solid color-mix(in srgb, var(--crit) 35%, transparent)}
+.banner b{color:var(--warn)}
+.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+.filters .field{min-width:170px}
+.ctxbar{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;justify-content:space-between}
+.ctx{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1 1 360px}
+.ctx-text{font-size:14px;display:flex;flex-wrap:wrap;gap:4px 14px;align-items:baseline}
+.ctx-text b{font-family:var(--f-display);font-size:18px}
+.ctx-text span{color:var(--muted)}
+.ctx-actions{display:flex;gap:8px;margin-top:2px}
+.btn.sm{padding:4px 10px;font-size:12.5px}
+.modal{position:fixed;inset:0;z-index:50;background:color-mix(in srgb, var(--ink) 48%, transparent);display:flex;align-items:center;justify-content:center;padding:max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px))}
+.modal-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;width:min(820px, 100%);max-height:100%;display:flex;flex-direction:column;box-shadow:0 24px 60px -20px color-mix(in srgb, var(--ink) 55%, transparent)}
+.modal-head{display:flex;justify-content:space-between;gap:12px;padding:18px 20px 10px;border-bottom:1px solid var(--line)}
+.modal-head p{margin:4px 0 6px;font-size:13px}
+.modal-body{padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:18px}
+.modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--line)}
+.mstep{display:flex;flex-direction:column;gap:8px}
+.iconbtn{border:0;background:none;font-size:24px;line-height:1;cursor:pointer;color:var(--muted);padding:2px 6px;border-radius:6px;height:max-content}
+.iconbtn:hover{color:var(--ink);background:var(--sunk)}
+.req{color:var(--crit)}
+.ferr{color:var(--crit);font-size:12px;min-height:0}
+.ferr:empty{display:none}
+.field input.invalid,.drop.invalid{border-color:var(--crit)}
+.hint{font-size:11.5px;color:var(--muted)}
+/* meter */
+.meter{display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:28px;align-items:center}
+.score{display:flex;flex-direction:column;gap:6px}
+.score .big{font-family:var(--f-display);font-size:64px;line-height:1;font-weight:700;letter-spacing:-.03em}
+.score .big small{font-size:26px;color:var(--muted);font-weight:500}
+.pill{display:inline-flex;align-items:center;gap:6px;border-radius:99px;padding:3px 10px;font-size:12px;font-weight:600;width:max-content}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.good{color:var(--good);background:var(--good-soft)} .pill.warn{color:var(--warn);background:var(--warn-soft)} .pill.crit{color:var(--crit);background:var(--crit-soft)} .pill.info{color:var(--info);background:var(--info-soft)}
+.bar{position:relative;height:30px;background:var(--sunk);border-radius:6px;overflow:visible;margin-top:26px;margin-bottom:30px}
+.bar .seg{position:absolute;top:0;bottom:0;left:0;border-radius:6px 0 0 6px}
+.bar .used{background:var(--accent)}
+.bar .proj{background:repeating-linear-gradient(135deg, color-mix(in srgb, var(--accent) 42%, transparent) 0 6px, color-mix(in srgb, var(--accent) 22%, transparent) 6px 12px)}
+.bar .over{background:repeating-linear-gradient(135deg, color-mix(in srgb, var(--crit) 55%, transparent) 0 6px, color-mix(in srgb, var(--crit) 25%, transparent) 6px 12px)}
+.tick{position:absolute;top:-6px;bottom:-6px;width:2px;background:var(--ink)}
+.tick span{position:absolute;white-space:nowrap;font-size:11.5px;transform:translateX(-50%);left:1px}
+.tick.up span{bottom:calc(100% + 2px)} .tick.down span{top:calc(100% + 2px)}
+.tick.snyk{background:var(--muted)} .tick.snyk span{color:var(--muted)}
+.tick.ent{background:var(--crit)}
+.legendrow{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;color:var(--muted)}
+.legendrow i{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;margin-right:6px}
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:0;border-top:1px solid var(--line);margin-top:18px;padding-top:14px}
+.kpis2{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:14px}
+.kpi .s .ok,.kpi .s .bad,.kpi .s .warnc{font-weight:600}
+.kpi{padding:0 14px;border-left:1px solid var(--line);min-width:0}
+.kpi:first-child{border-left:0;padding-left:0}
+.kpi .v{font-family:var(--f-display);font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .s{font-size:12px;color:var(--muted)}
+/* charts */
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+.chart{position:relative}
+.chart .col{transition:opacity .12s}
+.chart svg.hovering .col{opacity:.32} .chart svg.hovering .col.on{opacity:1}
+.chart .hit{cursor:crosshair;outline:none} .chart .hit.on{fill:color-mix(in srgb, var(--ink) 5%, transparent)}
+.chart text.val{fill:var(--ink);font-weight:500}
+.chart text.pct{font-weight:600;font-size:11px} .chart text.pct.ok{fill:var(--good)} .chart text.pct.bad{fill:var(--crit)} .chart text.pct.warnc{fill:var(--warn)} .chart text.pct.muted{fill:var(--muted)}
+.burn-note{margin:0 0 8px;font-size:13px;color:var(--muted);max-width:72ch} .burn-note b{color:var(--ink)} .burn-note b.ok{color:var(--good)} .burn-note b.bad{color:var(--crit)} .burn-note b.warnc,.warnc{color:var(--warn)}
+.tip{position:absolute;z-index:10;pointer-events:none;background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 30px -8px color-mix(in srgb, var(--ink) 30%, transparent);padding:12px 14px;min-width:260px;max-width:min(380px, calc(100% - 12px));font-size:12px}
+.tip-h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:600;color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+.tip-h .chip{text-transform:none;letter-spacing:0}
+.tip-big{font-family:var(--f-display);font-size:24px;font-weight:700;margin:4px 0 8px;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.tip-big small{font-family:var(--f-body);font-size:12px;font-weight:500;color:var(--muted)}
+.tip-d{font-family:var(--f-mono);font-size:11.5px;font-weight:500}
+.tip-t{width:100%;border-collapse:collapse;font-size:12px}
+.tip-t th{background:none;position:static;padding:2px 4px 4px;font-size:10.5px;border-bottom:1px solid var(--line);cursor:default}
+.tip-t td{padding:3px 4px;border-bottom:0;white-space:nowrap}
+.tip-t td.org{max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.tip-t tr.sum td{border-top:1px solid var(--line);padding-top:5px}
+.tip-sub{margin:8px 0 2px;font-weight:600;font-size:11.5px}
+.tip-f{margin-top:8px;padding-top:6px;border-top:1px solid var(--line);color:var(--muted);font-size:11.5px}
+.ok{color:var(--good)} .bad{color:var(--crit)}
+.chart svg{display:block;width:100%;height:auto}
+.dupk{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;border:1px solid var(--line);border-radius:8px}
+.dupk>div{padding:10px 12px;border-left:1px solid var(--line);min-width:0}
+.dupk>div:first-child{border-left:0}
+.dupk .v{font-family:var(--f-display);font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.dupk .s{font-size:11.5px;color:var(--muted)}
+@media (max-width:1300px){.dupk{grid-template-columns:repeat(2,minmax(0,1fr))}.dupk>div:nth-child(3){border-left:0}.dupk>div:nth-child(n+3){border-top:1px solid var(--line)}}
+.dup-proof{margin-top:12px;font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:6px;max-width:80ch}
+.dup-proof b{color:var(--ink)}
+.dupk .v.zero{color:var(--good)}
+.donut-wrap{display:grid;grid-template-columns:minmax(0,240px) minmax(0,1fr);gap:20px;align-items:center}
+.donut-wrap #donutChart{max-width:240px;width:100%;justify-self:center}
+.chart text.dc-big{fill:var(--ink);font-family:var(--f-display);font-size:22px;font-weight:700}
+.chart text.dc-sm{fill:var(--muted);font-size:10px}
+.donut-legend{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;font-size:12.5px}
+.donut-legend li{display:grid;grid-template-columns:10px minmax(0,1fr);gap:8px;align-items:start}
+.donut-legend li .sw{width:10px;height:10px;border-radius:50%;margin-top:4px}
+.donut-legend li b{font-variant-numeric:tabular-nums}
+.donut-legend li.zero{opacity:.55}
+@media (max-width:1200px){.donut-wrap{grid-template-columns:minmax(0,1fr)}.donut-legend{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.chart text{fill:var(--muted);font-family:var(--f-mono);font-size:10.5px}
+.chart .gl{stroke:var(--line);stroke-width:1}
+.chart-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+/* tables */
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+td.tdwrap{white-space:normal;min-width:220px;word-break:break-word}
+th{font-size:11.5px;color:var(--muted);font-weight:600;background:var(--sunk);position:sticky;top:0;cursor:pointer;user-select:none}
+th.n,td.n{text-align:right;font-variant-numeric:tabular-nums}
+th[data-dir="asc"]::after{content:" ▲";font-size:9px} th[data-dir="desc"]::after{content:" ▼";font-size:9px}
+tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:color-mix(in srgb, var(--accent-soft) 55%, transparent)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;vertical-align:0}
+.chip{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;background:var(--sunk);color:var(--muted);margin-right:4px;border:1px solid var(--line)}
+.chip.warn{color:var(--warn);background:var(--warn-soft);border-color:transparent}
+.spark{display:inline-block;vertical-align:middle}
+/* insights */
+.insights{display:flex;flex-direction:column;gap:10px}
+.ins{display:grid;grid-template-columns:4px minmax(0,1fr);gap:12px;padding:10px 12px 10px 0;border-bottom:1px solid var(--line)}
+.ins:last-child{border-bottom:0}
+.ins .stripe{border-radius:3px}
+.ins.good .stripe{background:var(--good)} .ins.warn .stripe{background:var(--warn)} .ins.crit .stripe{background:var(--crit)} .ins.info .stripe{background:var(--info)}
+.ins h3{margin-bottom:2px}
+.ins p{margin:0;color:var(--muted);font-size:13px}
+/* tabs */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);overflow-x:auto;margin-bottom:14px}
+.tab{border:0;background:none;padding:9px 14px;cursor:pointer;color:var(--muted);font-weight:600;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
+.tabbar{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;margin-bottom:10px}
+.tabbar input{border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:7px 10px;min-width:0;width:280px;max-width:100%}
+.ratecard td input{width:80px;border:1px solid var(--line);border-radius:6px;padding:4px 6px;background:var(--surface);text-align:right}
+.method{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}
+.method p,.method li{color:var(--muted);font-size:13px;max-width:68ch}
+.method ol{padding-left:18px;margin:6px 0}
+code{font-family:var(--f-mono);font-size:12px;background:var(--sunk);padding:1px 5px;border-radius:4px}
+.foot{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px}
+.toast{position:fixed;bottom:calc(16px + env(safe-area-inset-bottom, 0px));right:max(16px, env(safe-area-inset-right, 0px));background:var(--ink);color:var(--bg);padding:9px 14px;border-radius:8px;font-size:13px;opacity:0;transform:translateY(8px);transition:.2s;pointer-events:none}
+.toast.on{opacity:1;transform:none}
+@media (max-width:1000px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr));row-gap:14px}.kpi:nth-child(4){border-left:0;padding-left:0}.kpis2{grid-template-columns:repeat(2,minmax(0,1fr))}.kpis2 .kpi:nth-child(3){border-left:0;padding-left:0}.kpis2 .kpi:nth-child(4){border-left:1px solid var(--line);padding-left:14px}}
+@media (max-width:640px){.fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:820px){.setup,.meter,.grid2,.method{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:520px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.kpi{border-left:0;padding-left:0}.score .big{font-size:52px}.field.wide{grid-column:span 2}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg width="40" height="40" viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="10" fill="var(--accent)"/><path d="M9 27a11 11 0 0 1 22 0" fill="none" stroke="var(--on-accent)" stroke-width="2.6" stroke-linecap="round"/><path d="M20 27l6-8" stroke="var(--on-accent)" stroke-width="2.6" stroke-linecap="round"/><circle cx="20" cy="27" r="2.4" fill="var(--on-accent)"/></svg>
+      <div><h1>Snyk Credit Meter</h1><p>Drop a Billable events log export. Credits, projections and a utilization score are computed from the Platform Subscription rate card. <a href="https://snyk.io/policies/credit-based-billing/" target="_blank" rel="noopener">How usage is calculated ↗</a></p></div>
+    </div>
+    <div class="actions">
+      <div class="seg-ctl" role="radiogroup" aria-label="Theme">
+        <button type="button" role="radio" data-theme-opt="system" aria-checked="true" title="Follow system theme"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 14h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>System</button>
+        <button type="button" role="radio" data-theme-opt="light" aria-checked="false" title="Light theme"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3" fill="currentColor"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.4 1.4M11.6 11.6L13 13M3 13l1.4-1.4M11.6 4.4L13 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>Light</button>
+        <button type="button" role="radio" data-theme-opt="dark" aria-checked="false" title="Dark theme"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 10.2A6 6 0 0 1 5.8 2.5a6 6 0 1 0 7.7 7.7z" fill="currentColor"/></svg>Dark</button>
+      </div>
+      <button class="btn primary" id="btnLoad" type="button"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V2.5M4.5 6L8 2.5 11.5 6M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>Load billing data</button>
+      <button class="btn" id="btnSample" type="button">Load demo data</button>
+      <button class="btn" id="btnCopy" type="button">Copy summary</button>
+      <button class="btn" id="btnExport" type="button" hidden>Export to Excel</button>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+
+  <section class="ctxbar" aria-label="Account and filters">
+    <div class="ctx">
+      <span class="eyebrow">Account</span>
+      <div id="ctxText" class="ctx-text"></div>
+      <div class="ctx-actions"><button class="btn sm" id="btnEdit" type="button">Edit contract</button></div>
+    </div>
+    <div class="filters">
+      <div class="field"><label for="fGroup">Group</label><select id="fGroup"><option value="">All groups</option></select></div>
+      <div class="field"><label for="fCap">Capability</label><select id="fCap"><option value="">All capabilities</option></select></div>
+      <div class="field"><label for="fBasis">Run-rate basis</label>
+        <select id="fBasis"><option value="1">Latest day</option><option value="3">Last 3 days</option><option value="7" selected>Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option><option value="0">All days with data</option></select></div>
+    </div>
+  </section>
+  <p class="muted" id="filterNote" style="font-size:12.5px;margin:-10px 0 0" hidden></p>
+
+  <section class="panel" aria-label="Utilization score">
+    <div class="meter">
+      <div class="score">
+        <span class="eyebrow">Utilization score</span>
+        <div class="big num" id="scoreVal">–</div>
+        <span id="scorePill"></span>
+        <span class="muted" style="font-size:12.5px" id="scoreNote"></span>
+      </div>
+      <div style="min-width:0">
+        <div class="eyebrow">Credits through term end &middot; <span id="meterBasis"></span></div>
+        <div class="bar" id="meterBar"></div>
+        <div class="legendrow">
+          <span><i style="background:var(--accent)"></i>Used to date</span>
+          <span><i style="background:color-mix(in srgb, var(--accent) 35%, transparent)"></i>Projected at run-rate</span>
+          <span><i style="background:var(--muted);width:3px"></i>Snyk in-app projection</span>
+          <span><i style="background:var(--crit);width:3px"></i>Credits purchased</span>
+        </div>
+      </div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="kpis kpis2" id="kpis2"></div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel chart">
+      <div class="chart-head"><h2>Usage vs plan</h2><div class="seg-ctl" role="radiogroup" aria-label="Period"><button type="button" role="radio" data-gran="week" aria-checked="true">Weekly</button><button type="button" role="radio" data-gran="month" aria-checked="false">Monthly</button></div></div><p class="burn-note" id="burnNote"></p>
+      <div id="cumChart"></div>
+      <div class="legendrow" style="margin-top:8px">
+        <span><i style="background:var(--accent)"></i>Credits used</span>
+        <span><i style="background:color-mix(in srgb, var(--accent) 35%, transparent)"></i>Expected for the rest of the current period</span>
+        <span><i style="background:var(--good);height:3px;vertical-align:3px"></i>Plan: purchased credits spread evenly over the term</span>
+        <span>% = used against plan · * = period still in progress</span>
+      </div>
+    </div>
+    <div class="panel chart">
+      <div class="chart-head"><h2>Credits over time</h2><div class="seg-ctl" role="radiogroup" aria-label="Period"><button type="button" role="radio" data-dgran="day" aria-checked="true">Daily</button><button type="button" role="radio" data-dgran="week" aria-checked="false">Weekly</button><button type="button" role="radio" data-dgran="month" aria-checked="false">Monthly</button></div></div><div class="muted" style="font-size:12px;margin:-2px 0 6px" id="dailyNote"></div>
+      <div id="dailyChart"></div>
+      <div class="legendrow" id="capLegend" style="margin-top:8px"></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel chart">
+      <div class="chart-head"><h2>Duplicate scanning</h2><button class="btn sm" id="btnDupAll" type="button">See all</button></div>
+      <p class="burn-note" style="margin-top:-2px">The same repository, branch and file imported more than once: in another org, another group, or twice in one org.</p>
+      <div class="dupk" id="dupKpis"></div>
+      <div class="dup-proof" id="dupNote"></div>
+    </div>
+    <div class="panel chart">
+      <div class="chart-head"><h2>Cumulative usage by capability</h2><span class="muted" style="font-size:12px" id="donutNote">term to date</span></div>
+      <div class="donut-wrap"><div id="donutChart"></div><ul class="donut-legend" id="donutLegend"></ul></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="chart-head"><h2>Capabilities</h2><span class="muted" style="font-size:12px">units × rate = credits</span></div>
+    <div id="capTable"></div>
+  </section>
+
+  <section class="panel">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" aria-selected="true" data-tab="groups" type="button">Groups</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="orgs" type="button">Organizations</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="repos" type="button">Repositories &amp; images</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="sources" type="button">Sources &amp; tests</button>
+      <button class="tab" role="tab" aria-selected="false" data-tab="dups" type="button">Duplicate scans</button>
+    </div>
+    <div class="tabbar"><span class="muted" id="tabNote" style="font-size:12.5px"></span><input id="search" type="search" placeholder="Search name, org, group…" aria-label="Search table"></div>
+    <div id="tabBody"></div>
+  </section>
+
+  <footer class="foot"><span>Files are read in your browser. Nothing you load leaves this page. <a href="https://snyk.io/policies/credit-based-billing/" target="_blank" rel="noopener">How usage is calculated ↗</a></span><span id="footInfo"></span></footer>
+</div>
+<div class="modal" id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <div class="modal-head">
+      <div><h2 id="mTitle">Load billing usage data</h2><p class="muted" id="mSub">Upload the tenant's billable events export and enter the contract. Fields marked * are required.</p></div>
+      <button class="iconbtn" id="mClose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="mstep"><span class="eyebrow">1 &middot; Billable events export <span class="req">*</span></span>
+        <label class="drop" id="drop" for="file" tabindex="0">
+          <strong>Drop CSV or XLSX files here, or click to choose</strong>
+          <span class="muted" style="font-size:12.5px">In Snyk: Group or tenant &rarr; Credit breakdown &rarr; Billable events log &rarr; Download CSV. Several files can be combined; duplicate events are removed by EVENT_ID.</span>
+          <span class="files" id="fileInfo">No file chosen yet.</span>
+          <div class="progress" aria-hidden="true"><i id="prog"></i></div>
+          <input type="file" id="file" accept=".csv,.xlsx,.xls,text/csv" multiple hidden>
+        </label>
+        <span class="ferr" id="err_drop"></span>
+      </div>
+      <div class="mstep"><span class="eyebrow">2 &middot; Contract, from the Order or the Credit breakdown page</span>
+        <div class="fields">
+          <div class="field wide"><label for="fCustomer">Customer <span class="req">*</span></label><input id="fCustomer" type="text" placeholder="Account name" aria-required="true"><span class="ferr" id="err_fCustomer"></span></div>
+          <div class="field"><label for="fCredits">Credits purchased <span class="req">*</span></label><input id="fCredits" type="number" min="1" step="1000" inputmode="numeric" placeholder="e.g. 585000" aria-required="true"><span class="ferr" id="err_fCredits"></span></div>
+          <div class="field"><label for="fPrice">Price per credit</label><input id="fPrice" type="number" min="0" step="0.01" placeholder="Optional"></div>
+          <div class="field"><label for="fStart">Term start <span class="req">*</span></label><input id="fStart" type="date" aria-required="true"><span class="ferr" id="err_fStart"></span></div>
+          <div class="field"><label for="fEnd">Term end <span class="req">*</span></label><input id="fEnd" type="date" aria-required="true"><span class="ferr" id="err_fEnd"></span></div>
+          <div class="field wide"><label for="fAsOf">As of</label><input id="fAsOf" type="date"><span class="hint">Leave empty to use the day after the last event in the file.</span></div>
+        </div>
+      </div>
+      <div class="banner err" id="mErr" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="mCancel" type="button">Cancel</button>
+      <button class="btn primary" id="btnBuild" type="button">Build dashboard</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+/*ENGINE-START*/
+const CAPS = {
+  opensource:{label:'Open Source', rate:1,    unit:'Active contributor', unitShort:'contributors'},
+  code:      {label:'Code',        rate:1,    unit:'Active contributor', unitShort:'contributors'},
+  container: {label:'Container',   rate:0.33, unit:'Monitored image',    unitShort:'images'},
+  iac:       {label:'IaC',         rate:0.33, unit:'Active contributor', unitShort:'contributors'},
+  secrets:   {label:'Secrets',     rate:0.66, unit:'Active contributor', unitShort:'contributors'},
+  aispm:     {label:'AI-SPM',      rate:0.66, unit:'Active contributor', unitShort:'contributors'},
+  apiweb:    {label:'API and Web', rate:3,    unit:'Provisioned target', unitShort:'targets'},
+  agent:     {label:'Coding Agent Security', rate:1, unit:'Active machine', unitShort:'machines'},
+  pentest:   {label:'AI Pentesting', rate:4000, unit:'Assessment', unitShort:'assessments'}
+};
+const CAP_ORDER = Object.keys(CAPS);
+const ALIAS = {code:'code',snykcode:'code',sast:'code',opensource:'opensource',snykopensource:'opensource',oss:'opensource',sca:'opensource',
+  iac:'iac',infrastructureascode:'iac',snykinfrastructureascode:'iac',snykiac:'iac',secrets:'secrets',snyksecrets:'secrets',aispm:'aispm',
+  container:'container',snykcontainer:'container',apiandweb:'apiweb',apiweb:'apiweb',dast:'apiweb',snykapiandweb:'apiweb',
+  codingagentsecurity:'agent',agentsecurity:'agent',aipentesting:'pentest',pentesting:'pentest',pentest:'pentest'};
+const norm = s => String(s==null?'':s).toLowerCase().replace(/[^a-z0-9]/g,'');
+function capOf(type, display){ return ALIAS[norm(type)] || ALIAS[norm(display)] || null; }
+function isTest(type){ const t = norm(type); return t.includes('test'); }
+const DEFAULT_BRANCHES = new Set(['main','master','develop','development','dev','trunk','default','release','prod','production']);
+
+function toDay(v){
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return isNaN(v) ? null : v.toISOString().slice(0,10);
+  if (typeof v === 'number') { const d = new Date(Math.round((v - 25569) * 864e5)); return isNaN(d) ? null : d.toISOString().slice(0,10); }
+  const s = String(v).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return m[1]+'-'+m[2]+'-'+m[3];
+  const d = new Date(s); return isNaN(d) ? null : d.toISOString().slice(0,10);
+}
+const dayMs = 864e5;
+const dnum = s => { const [y,m,d] = s.split('-').map(Number); return Date.UTC(y,m-1,d)/dayMs; };
+const dstr = n => new Date(n*dayMs).toISOString().slice(0,10);
+
+function parseProject(name){
+  const raw = String(name||'').trim();
+  const out = {repo: raw || '(unnamed)', branch:'', target:'', kind:'Other', registry:''};
+  if (!raw) return out;
+  let m = raw.match(/^([a-z0-9.-]+\.(?:amazonaws\.com|azurecr\.io|gcr\.io|pkg\.dev|docker\.io|ghcr\.io|quay\.io|jfrog\.io|[a-z]{2,})(?::\d+)?)\/(.+)$/i);
+  if (m && !/\(/.test(raw)) {
+    const host = m[1].toLowerCase(); let path = m[2]; let tag = '';
+    const at = path.indexOf('@'); if (at > -1) { tag = path.slice(at+1); path = path.slice(0,at); }
+    const c = path.lastIndexOf(':'); if (c > path.lastIndexOf('/')) { tag = path.slice(c+1); path = path.slice(0,c); }
+    out.repo = path; out.target = tag; out.registry = host;
+    out.kind = /\.dkr\.ecr\./.test(host) ? 'Amazon ECR' : /azurecr\.io/.test(host) ? 'Azure ACR' : /(gcr\.io|pkg\.dev)/.test(host) ? 'Google Artifact Registry' : /docker\.io/.test(host) ? 'Docker Hub' : /ghcr\.io/.test(host) ? 'GitHub Packages' : /jfrog\.io/.test(host) ? 'JFrog Artifactory' : 'Container registry';
+    return out;
+  }
+  m = raw.match(/^([^()]+?)\(([^)]*)\)(?::(.*))?$/);
+  if (m) { out.repo = m[1].trim(); out.branch = m[2].trim(); out.target = (m[3]||'').trim(); out.kind = 'SCM integration'; return out; }
+  m = raw.match(/^([^:\s]+\/[^:\s]+):(.+)$/);
+  if (m) { out.repo = m[1]; out.target = m[2]; out.kind = 'SCM integration'; return out; }
+  m = raw.match(/^([^:\s/]+):(.+)$/);
+  if (m) { out.repo = m[1]; out.target = m[2]; out.kind = 'CLI / CI'; return out; }
+  out.kind = /\//.test(raw) ? 'SCM integration' : 'CLI / CI';
+  return out;
+}
+
+function newState(){
+  return {seen:new Set(), rows:0, dup:0, badDate:0, bill:new Map(), tests:new Map(), testDaily:new Map(), unknown:new Map(),
+    orgs:new Map(), groups:new Set(), billMin:null, billMax:null, allMin:null, allMax:null, files:[], sample:false};
+}
+function ingest(st, r){
+  const type = r.BILLABLE_EVENT_TYPE; if (!type) return;
+  const id = r.EVENT_ID;
+  if (id) { if (st.seen.has(id)) { st.dup++; return; } st.seen.add(id); }
+  const d = toDay(r.CREATED_AT); if (!d) { st.badDate++; return; }
+  st.rows++;
+  if (!st.allMin || d < st.allMin) st.allMin = d; if (!st.allMax || d > st.allMax) st.allMax = d;
+  const g = r.GROUP_NAME || r.GROUP_PUBLIC_ID || '(no group)';
+  const o = r.ORG_PUBLIC_ID || r.ORG_NAME || '(no org)';
+  st.groups.add(g);
+  if (!st.orgs.has(o)) st.orgs.set(o, {id:o, name:(r.ORG_DISPLAY_NAME || r.ORG_NAME || o).trim(), slug:r.ORG_NAME||'', group:g});
+  if (isTest(type)) {
+    const tcap = capOf(r.PRODUCT_CODE, r.PRODUCT_DISPLAY_NAME) || 'other';
+    const flow = r.FLOW || 'unknown';
+    const pid = (r.PROJECT_PUBLIC_ID && r.PROJECT_PUBLIC_ID !== 'n-a') ? r.PROJECT_PUBLIC_ID : (o+'|'+(r.PROJECT_NAME||''));
+    let p = st.tests.get(pid);
+    if (!p) { p = {pid, name:r.PROJECT_NAME||'', url:r.PROJECT_URL||'', org:o, group:g, cap:tcap, n:0, flows:{}, first:r.CREATED_AT, last:r.CREATED_AT}; st.tests.set(pid, p); }
+    p.n++; p.flows[flow] = (p.flows[flow]||0) + 1;
+    const ca = String(r.CREATED_AT); if (ca > p.last) p.last = ca; if (ca < p.first) p.first = ca;
+    const k = d+'\u0001'+g+'\u0001'+o+'\u0001'+tcap+'\u0001'+flow;
+    st.testDaily.set(k, (st.testDaily.get(k)||0) + 1);
+    return;
+  }
+  const cap = capOf(type, r.BILLABLE_EVENT_DISPLAY_NAME);
+  if (!cap) { st.unknown.set(type, (st.unknown.get(type)||0) + 1); return; }
+  if (!st.billMin || d < st.billMin) st.billMin = d; if (!st.billMax || d > st.billMax) st.billMax = d;
+  const k = d+'\u0001'+g+'\u0001'+o+'\u0001'+cap;
+  st.bill.set(k, (st.bill.get(k)||0) + 1);
+}
+function finalize(st){
+  st.billArr = []; for (const [k,n] of st.bill) { const [d,g,o,c] = k.split('\u0001'); st.billArr.push({d,g,o,c,n}); }
+  st.testArr = []; for (const [k,n] of st.testDaily) { const [d,g,o,c,f] = k.split('\u0001'); st.testArr.push({d,g,o,c,f,n}); }
+  st.projArr = [...st.tests.values()].map(p => Object.assign(p, parseProject(p.name)));
+  return st;
+}
+
+function compute(st, s, f){
+  const rates = s.rates; const fg = f.group || ''; const fc = f.cap || '';
+  const keep = x => (!fg || x.g === fg) && (!fc || x.c === fc);
+  const B = st.billArr.filter(keep);
+  const T = st.testArr.filter(keep);
+  const P = st.projArr.filter(p => (!fg || p.group === fg) && (!fc || p.cap === fc));
+  const m = {empty: B.length === 0 && T.length === 0};
+  // calendar of billable days
+  const d0 = st.billMin, d1 = st.billMax;
+  const days = []; if (d0) for (let n = dnum(d0); n <= dnum(d1); n++) days.push(dstr(n));
+  const di = new Map(days.map((d,i)=>[d,i]));
+  const capsPresent = new Set(B.map(x=>x.c));
+  const caps = CAP_ORDER.filter(c => capsPresent.has(c));
+  const units = {}, credits = {}; caps.forEach(c => { units[c] = new Array(days.length).fill(0); credits[c] = 0; });
+  const byGroup = new Map(), byOrg = new Map();
+  let used = 0;
+  for (const x of B) {
+    const cr = x.n * rates[x.c]; used += cr; credits[x.c] += cr; units[x.c][di.get(x.d)] += x.n;
+    let g = byGroup.get(x.g); if (!g) { g = {group:x.g, credits:0, orgs:new Set(), cap:{}, daily:new Array(days.length).fill(0)}; byGroup.set(x.g, g); }
+    g.credits += cr; g.orgs.add(x.o); g.cap[x.c] = (g.cap[x.c]||0) + cr; g.daily[di.get(x.d)] += cr;
+    let o = byOrg.get(x.o); if (!o) { const meta = st.orgs.get(x.o) || {name:x.o, group:x.g}; o = {id:x.o, name:meta.name, slug:meta.slug, group:x.g, credits:0, cap:{}, units:{}, daily:new Array(days.length).fill(0)}; byOrg.set(x.o, o); }
+    o.credits += cr; o.cap[x.c] = (o.cap[x.c]||0) + cr; o.daily[di.get(x.d)] += cr;
+    if (!o.units[x.c]) o.units[x.c] = new Array(days.length).fill(0); o.units[x.c][di.get(x.d)] += x.n;
+  }
+  const dailyCredits = days.map((_,i) => caps.reduce((a,c) => a + units[c][i]*rates[c], 0));
+  // contract math
+  const ent = +s.credits || 0;
+  const tStart = s.start ? dnum(s.start) : (d0 ? dnum(d0) : null);
+  const tEnd = s.end ? dnum(s.end) : (tStart != null ? tStart + 365 : null);
+  const asOf = s.asOf ? dnum(s.asOf) : (d1 ? dnum(d1) + 1 : null);
+  const termDays = (tStart!=null && tEnd!=null) ? Math.max(1, tEnd - tStart) : 365;
+  const daysInto = (tStart!=null && asOf!=null) ? Math.min(termDays, Math.max(0, asOf - tStart)) : 0;
+  const daysLeft = termDays - daysInto;
+  const basis = +s.basis; const W = basis > 0 ? Math.min(basis, days.length) : days.length;
+  const win = dailyCredits.slice(days.length - W);
+  const rate = W ? win.reduce((a,b)=>a+b,0) / W : 0;
+  const latest = days.length ? dailyCredits[days.length-1] : 0;
+  const projRun = used + rate * daysLeft;
+  const projLatest = used + latest * daysLeft;
+  const projLinear = daysInto > 0 ? used / daysInto * termDays : null;
+  const evenPace = ent ? ent / termDays : 0;
+  const score = ent ? projRun / ent * 100 : null;
+  let band = null;
+  if (score != null) band = score < 50 ? {k:'crit', t:'Under-consuming'} : score < 85 ? {k:'warn', t:'Below plan'} : score <= 100 ? {k:'good', t:'On plan'} : score <= 110 ? {k:'warn', t:'Overage risk'} : {k:'crit', t:'Overage likely'};
+  let exhaust = null;
+  if (ent && rate > 0 && projRun > ent) { const rem = ent - used; exhaust = rem <= 0 ? (asOf!=null?dstr(asOf):null) : dstr(asOf + Math.ceil(rem / rate)); }
+  const unused = ent ? Math.max(0, ent - projRun) : 0;
+  const overage = ent ? Math.max(0, projRun - ent) : 0;
+  const needDaily = daysLeft > 0 && ent ? Math.max(0, (ent - used) / daysLeft) : 0;
+  Object.assign(m, {days, caps, units, credits, used, dailyCredits, byGroup, byOrg, ent, tStart, tEnd, asOf, termDays, daysInto, daysLeft,
+    W, rate, latest, projRun, projLatest, projLinear, evenPace, score, band, exhaust, unused, overage, needDaily, price:+s.price||0});
+  // capability rows
+  m.capRows = caps.map(c => {
+    const u = units[c]; const last = u[u.length-1]||0; const wu = u.slice(u.length - W);
+    return {c, label:CAPS[c].label, unit:CAPS[c].unit, rate:rates[c], unitDays:u.reduce((a,b)=>a+b,0), latest:last,
+      avg: wu.length ? wu.reduce((a,b)=>a+b,0)/wu.length : 0, peak:Math.max(...u), credits:credits[c], share: used ? credits[c]/used : 0, perDay:last*rates[c]};
+  });
+  // tests
+  const testsByOrgCap = new Map(), testsByOrg = new Map(), flowCap = new Map(); let testsTotal = 0;
+  for (const x of T) { testsTotal += x.n; testsByOrgCap.set(x.o+'|'+x.c, (testsByOrgCap.get(x.o+'|'+x.c)||0) + x.n); testsByOrg.set(x.o, (testsByOrg.get(x.o)||0) + x.n);
+    const k = x.c+'|'+x.f; flowCap.set(k, (flowCap.get(k)||0) + x.n); }
+  m.testsTotal = testsTotal; m.flowCap = flowCap;
+  // repos
+  const repos = new Map();
+  for (const p of P) {
+    const k = p.group+'|'+p.org+'|'+p.repo;
+    let r = repos.get(k); if (!r) { const om = st.orgs.get(p.org)||{name:p.org}; r = {repo:p.repo, org:om.name, orgId:p.org, group:p.group, kind:p.kind, registry:p.registry, caps:new Set(), projects:0, branches:new Set(), targets:new Set(), tests:0, flows:{}, last:'', url:p.url}; repos.set(k, r); }
+    r.caps.add(p.cap); r.projects++; if (p.branch) r.branches.add(p.branch); if (p.target) r.targets.add(p.target); r.tests += p.n;
+    for (const fk in p.flows) r.flows[fk] = (r.flows[fk]||0) + p.flows[fk];
+    if (p.last > r.last) r.last = p.last;
+  }
+  m.repos = [...repos.values()].map(r => Object.assign(r, {nonDefault:[...r.branches].filter(b => !DEFAULT_BRANCHES.has(b.toLowerCase())).length}));
+  m.projects = P;
+  const reposByOrg = new Map(); for (const r of m.repos) reposByOrg.set(r.orgId, (reposByOrg.get(r.orgId)||0) + 1);
+  // source mix
+  const kinds = new Map(); for (const p of P) { let k = kinds.get(p.kind); if (!k) { k = {kind:p.kind, projects:0, tests:0, repos:new Set()}; kinds.set(p.kind, k); } k.projects++; k.tests += p.n; k.repos.add(p.group+'|'+p.org+'|'+p.repo); }
+  m.kinds = [...kinds.values()];
+  // org rows
+  m.orgRows = [...byOrg.values()].map(o => {
+    const n = days.length; const first = o.daily.findIndex(v => v > 0);
+    const lu = {}; for (const c in o.units) lu[c] = o.units[c][n-1] || 0;
+    const untested = Object.keys(o.cap).filter(c => !testsByOrgCap.get(o.id+'|'+c));
+    return Object.assign(o, {perDay:o.daily[n-1]||0, firstDay:o.daily[first]||0, share: used ? o.credits/used : 0, lu, tests:testsByOrg.get(o.id)||0, repos:reposByOrg.get(o.id)||0, untested});
+  });
+  // orgs with tests but no credits (visible in repo tab only) are ignored here
+  m.groupRows = [...byGroup.values()].map(g => ({group:g.group, orgs:g.orgs.size, credits:g.credits, share: used ? g.credits/used : 0, cap:g.cap, perDay:g.daily[g.daily.length-1]||0, daily:g.daily,
+    tests:T.filter(x=>x.g===g.group).reduce((a,x)=>a+x.n,0)}));
+  m.dups = findDuplicates(st, P);
+  m.insights = buildInsights(st, m, rates);
+  return m;
+}
+
+function findDuplicates(st, P){
+  // a copy = same capability + repository + branch + target file; CLI projects without a repo-qualified name are skipped
+  const copies = new Map();
+  for (const p of P) {
+    if (p.kind === 'CLI / CI') continue;
+    const k = [p.cap, p.repo, p.branch, p.target].join('|').toLowerCase();
+    let c = copies.get(k); if (!c) { c = []; copies.set(k, c); } c.push(p);
+  }
+  const repos = new Map(); let dupProjects = 0, dupTests = 0, totalTests = 0;
+  for (const list of copies.values()) {
+    const rk = list[0].repo.toLowerCase();
+    let r = repos.get(rk); if (!r) { r = {repo:list[0].repo, kind:list[0].kind, orgs:new Set(), groups:new Set(), caps:new Set(), projects:0, dupProjects:0, tests:0, dupTests:0, sameOrg:0}; repos.set(rk, r); }
+    const t = list.reduce((a,p) => a + p.n, 0); const keep = Math.max(...list.map(p => p.n));
+    list.forEach(p => { r.orgs.add(p.org); r.groups.add(p.group); r.caps.add(p.cap); });
+    r.projects += list.length; r.tests += t; totalTests += t;
+    if (list.length > 1) { r.dupProjects += list.length - 1; r.dupTests += t - keep; dupProjects += list.length - 1; dupTests += t - keep;
+      if (new Set(list.map(p => p.org)).size < list.length) r.sameOrg += list.length - new Set(list.map(p => p.org)).size; }
+  }
+  const rows = [...repos.values()].filter(r => r.orgs.size > 1 || r.dupProjects > 0).map(r => Object.assign(r, {
+    orgNames:[...r.orgs].map(o => (st.orgs.get(o)||{name:o}).name).sort(), groupNames:[...r.groups].sort(), crossGroup: r.groups.size > 1 }));
+  return {rows, repos:rows.length, multiOrg:rows.filter(r => r.orgs.size > 1).length, crossGroup:rows.filter(r => r.crossGroup).length,
+    dupProjects, dupTests, totalTests, share: totalTests ? dupTests / totalTests : 0};
+}
+function buildInsights(st, m, rates){
+  const out = []; const F = (n,dp=0) => Number(n).toLocaleString('en-US',{maximumFractionDigits:dp, minimumFractionDigits:dp});
+  if (!m.days.length) return out;
+  if (m.score != null) {
+    const sev = m.band.k;
+    let body = `At ${F(m.rate)} credits/day (${m.W === 1 ? 'latest day' : m.W+'-day average'}), the account ends the term near ${F(m.projRun)} of ${F(m.ent)} credits.`;
+    if (m.unused > 0) body += ` About ${F(m.unused)} credits${m.price ? ' (' + F(m.unused*m.price,0) + ' in value)' : ''} would expire unused. Reaching full use needs ${F(m.needDaily)} credits/day from here.`;
+    else body += ` Credits run out around ${m.exhaust}; about ${F(m.overage)} credits${m.price ? ' (' + F(m.overage*m.price,0) + ')' : ''} would be invoiced on demand.`;
+    out.push({sev, title:`${m.band.t}: ${F(m.score,1)}% of purchased credits projected`, body});
+  }
+  if (m.projLinear != null && m.tStart != null && dnum(st.billMin) - m.tStart > 7 && m.ent) {
+    out.push({sev:'info', title:`The in-app projection reads ${F(m.projLinear/m.ent*100,3)}% because metering began on ${st.billMin}`,
+      body:`Snyk spreads ${F(m.used)} credits over all ${m.daysInto} days into the term, ${dnum(st.billMin) - m.tStart} of which had no metered usage. The run-rate view uses current daily consumption instead.`});
+  }
+  // step changes per org × capability (skip the first data day, often partial)
+  const steps = [];
+  for (const o of m.orgRows) for (const c in o.units) {
+    const u = o.units[c]; let best = null;
+    for (let i = 2; i < u.length; i++) { const dlt = u[i] - u[i-1]; if (Math.abs(dlt) >= Math.max(5, 0.2*u[i-1]) && (!best || Math.abs(dlt) > Math.abs(best.dlt))) best = {i, dlt, from:u[i-1], to:u[i]}; }
+    if (best && Math.abs(m.units[c][best.i] - m.units[c][best.i-1]) < 0.5 * Math.abs(best.dlt)) best = null; // moved between orgs, not a real change
+    if (best) steps.push({org:o.name, group:o.group, c, ...best, cr: best.dlt * rates[c]});
+  }
+  steps.sort((a,b) => Math.abs(b.cr) - Math.abs(a.cr));
+  steps.slice(0,4).forEach(s => out.push({sev: s.dlt < 0 ? 'good' : 'warn',
+    title: s.from === 0 ? `${s.org}: ${CAPS[s.c].label} started billing ${F(s.to)} ${CAPS[s.c].unitShort} on ${m.days[s.i]}` : `${s.org}: ${CAPS[s.c].label} ${s.dlt<0?'fell':'rose'} from ${F(s.from)} to ${F(s.to)} ${CAPS[s.c].unitShort} on ${m.days[s.i]}`,
+    body:`${s.dlt<0?'Saves':'Adds'} about ${F(Math.abs(s.cr),1)} credits/day (${F(Math.abs(s.cr)*m.daysLeft)} over the rest of the term). Group: ${s.group}.`}));
+  // first day partial
+  if (m.days.length > 2) { const d0 = m.dailyCredits[0], d1 = m.dailyCredits[1]; if (d0 < 0.7*d1) out.push({sev:'info', title:`${m.days[0]} looks like a partial first day`, body:`It has ${F(d0)} credits against ${F(d1)} the next day. Run-rate bases shorter than the data range leave it out.`}); }
+  // concentration
+  const orgs = [...m.orgRows].sort((a,b)=>b.credits-a.credits);
+  if (orgs.length > 3) { const top3 = orgs.slice(0,3); const sh = top3.reduce((a,o)=>a+o.share,0);
+    out.push({sev:'info', title:`${F(sh*100)}% of credits come from three orgs`, body: top3.map(o => `${o.name} ${F(o.credits)} (${F(o.share*100)}%)`).join(' · ')}); }
+  // container share
+  const cont = m.capRows.find(r => r.c === 'container');
+  if (cont && cont.share > 0.3) out.push({sev:'warn', title:`Container is ${F(cont.share*100)}% of credits (${F(cont.latest)} images on the latest day)`,
+    body:`Each unique image digest with an open Container project bills 0.33/day, whatever tag or org references it. Archive or delete projects for retired tags and old builds. Dockerfile-only scans do not bill.`});
+  // billable but no tests in the period
+  const idle = []; for (const o of m.orgRows) for (const c of o.untested) idle.push({o, c, cr:o.cap[c]});
+  idle.sort((a,b)=>b.cr-a.cr);
+  if (idle.length && m.testsTotal > 0) out.push({sev:'warn', title:`${idle.length} org × capability pairs billed with no tests in the period`,
+    body:`Repositories count as monitored even when not scanned. Check for stale imports: ` + idle.slice(0,5).map(x => `${x.o.name} / ${CAPS[x.c].label} (${F(x.cr,1)} cr)`).join(' · ')});
+  // branch projects
+  const nd = m.repos.reduce((a,r)=>a+r.nonDefault,0); const ndRepos = m.repos.filter(r=>r.nonDefault>0);
+  if (nd > 0) { const top = [...ndRepos].sort((a,b)=>b.nonDefault-a.nonDefault).slice(0,3);
+    out.push({sev:'info', title:`${F(ndRepos.length)} repositories also monitor feature or fix branches (${F(nd)} branches)`,
+      body:`Branch projects do not add Active Contributors (people are counted once by username), but images built from them are separate Monitored Images and every project adds tests. Most branches: ` + top.map(r=>`${r.repo} (${r.nonDefault})`).join(' · ')}); }
+  if (st.unknown.size) out.push({sev:'crit', title:`${F([...st.unknown.values()].reduce((a,b)=>a+b,0))} rows have an event type with no rate`, body:`Types: ${[...st.unknown.keys()].join(', ')}. They are excluded from credits. Add the rate in the rate card if they are billable.`});
+  if (st.dup) out.push({sev:'info', title:`${F(st.dup)} duplicate events removed`, body:`Rows with an EVENT_ID already loaded from another file were skipped.`});
+  return out;
+}
+/*ENGINE-END*/
+
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const F = (n,dp=0) => (n==null||isNaN(n)) ? '–' : Number(n).toLocaleString('en-US',{maximumFractionDigits:dp, minimumFractionDigits:dp});
+const FK = n => { n = +n; const a = Math.abs(n); return a >= 1e6 ? F(n/1e6, a>=1e7?0:1)+'M' : a >= 1e4 ? F(n/1e3,0)+'K' : a >= 1e3 ? F(n/1e3,1)+'K' : F(n,0); };
+const fdate = s => { if (!s) return '–'; const d = new Date(s+'T00:00:00Z'); return d.toLocaleDateString('en-US',{month:'short', day:'numeric', year:'numeric', timeZone:'UTC'}); };
+const capColor = c => `var(--c-${c})`;
+const LS = 'credit-meter-v1';
+let ST = null, MODEL = null, TAB = 'groups', SORT = {}, downloads = null;
+const rates = Object.fromEntries(CAP_ORDER.map(c => [c, CAPS[c].rate]));
+
+function settings(){ return {credits:$('fCredits').value, price:$('fPrice').value, start:$('fStart').value, end:$('fEnd').value, asOf:$('fAsOf').value, basis:$('fBasis').value, rates}; }
+function saveSettings(){ if (ST && ST.sample) return; try { localStorage.setItem(LS, JSON.stringify({customer:$('fCustomer').value, credits:$('fCredits').value, price:$('fPrice').value, start:$('fStart').value, end:$('fEnd').value, basis:$('fBasis').value})); } catch(e){} }
+function loadSettings(){ try { return JSON.parse(localStorage.getItem(LS)||'null'); } catch(e){ return null; } }
+function toast(t){ const el = $('toast'); el.textContent = t; el.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(()=>el.classList.remove('on'), 2400); }
+
+// ---- loading ----
+const HDR = h => String(h).trim().toUpperCase().replace(/\s+/g,'_');
+async function loadFiles(files){
+  const st = newState(); const total = [...files].reduce((a,f)=>a+f.size,0); let done = 0;
+  $('mErr').hidden = true; $('fileInfo').textContent = 'Reading…';
+  try {
+    for (const file of files) {
+      if (/\.xlsx?$/i.test(file.name)) {
+        const buf = await file.arrayBuffer(); const wb = XLSX.read(buf, {type:'array', cellDates:true});
+        const ws = wb.Sheets[wb.SheetNames[0]]; const rows = XLSX.utils.sheet_to_json(ws, {defval:'', raw:true});
+        for (const r of rows) { const o = {}; for (const k in r) o[HDR(k)] = r[k]; ingest(st, o); }
+        done += file.size; $('prog').style.width = (done/total*100)+'%';
+      } else {
+        await new Promise((res, rej) => Papa.parse(file, {header:true, skipEmptyLines:true, transformHeader:HDR, chunkSize: 4*1024*1024,
+          chunk: r => { for (const row of r.data) ingest(st, row); $('prog').style.width = ((done + r.meta.cursor)/total*100)+'%'; },
+          complete: () => { done += file.size; res(); }, error: rej }));
+      }
+      st.files.push(file.name);
+    }
+  } catch (e) { return showError('That file could not be read: ' + (e && e.message || e) + '. Export the Billable events log as CSV and try again.'); }
+  if (!st.rows) return showError('No billable events found. The file needs BILLABLE_EVENT_TYPE and CREATED_AT columns, as in the Billable events log export.');
+  finalize(st); ST = st;
+  $('fileInfo').textContent = `${st.files.join(', ')} · ${F(st.rows)} events · ${fdate(st.allMin)} – ${fdate(st.allMax)}`;
+  if (!$('fAsOf').value) $('fAsOf').value = st.billMax ? dstr(dnum(st.billMax)+1) : '';
+  $('fGroup').value = ''; $('fCap').value = '';
+  fillFilters(); render();
+  return true;
+}
+function showError(t){ $('mErr').textContent = t; $('mErr').hidden = false; $('fileInfo').textContent = 'No file loaded.'; $('prog').style.width = '0'; return false; }
+
+// ---- load-data dialog ----
+let PENDING = null, MODE = 'new', SNAP = null;
+const MFIELDS = ['fCustomer','fCredits','fPrice','fStart','fEnd','fAsOf'];
+function openModal(mode){
+  MODE = mode; PENDING = null; SNAP = MFIELDS.map(id => $(id).value);
+  $('mErr').hidden = true; clearErrs(); $('prog').style.width = '0';
+  if (!ST || ST.sample) { const sv = loadSettings() || {}; $('fCustomer').value = sv.customer || ''; $('fCredits').value = sv.credits || ''; $('fPrice').value = sv.price || ''; $('fStart').value = sv.start || ''; $('fEnd').value = sv.end || ''; $('fAsOf').value = ''; }
+  const real = ST && !ST.sample;
+  $('mTitle').textContent = mode === 'edit' && real ? 'Edit contract' : 'Load billing usage data';
+  $('mSub').textContent = mode === 'edit' && real ? 'Change the contract details, or drop a newer export to replace the current data. Fields marked * are required.' : 'Upload the tenant\'s billable events export and enter the contract. Fields marked * are required.';
+  $('fileInfo').textContent = mode === 'edit' && real ? `Current: ${ST.files.join(', ')}. Drop a new file to replace it.` : 'No file chosen yet.';
+  $('btnBuild').textContent = mode === 'edit' && real ? 'Update dashboard' : 'Build dashboard';
+  $('modal').hidden = false; document.body.style.overflow = 'hidden';
+  setTimeout(() => (mode === 'edit' && real ? $('fCustomer') : $('drop')).focus(), 30);
+}
+function closeModal(restore){
+  if (restore && SNAP) MFIELDS.forEach((id,i) => $(id).value = SNAP[i]);
+  $('modal').hidden = true; document.body.style.overflow = ''; PENDING = null;
+}
+function setPending(files){
+  PENDING = files; $('err_drop').textContent = ''; $('drop').classList.remove('invalid');
+  const size = [...files].reduce((a,f) => a + f.size, 0);
+  $('fileInfo').textContent = `Selected: ${[...files].map(f => f.name).join(', ')} (${F(size/1048576,1)} MB)`;
+  $('fAsOf').value = '';
+}
+function clearErrs(){ document.querySelectorAll('.ferr').forEach(e => e.textContent = ''); document.querySelectorAll('.invalid').forEach(e => e.classList.remove('invalid')); }
+function fieldErr(id, msg){ const el = $(id); if (el) el.classList.add('invalid'); const e = $('err_'+id); if (e) e.textContent = msg; }
+function validate(){
+  clearErrs(); let ok = true; const bad = (id, msg) => { fieldErr(id, msg); ok = false; };
+  const needFile = MODE === 'new' || !ST || ST.sample;
+  if (needFile && !PENDING) bad('drop', 'Choose the billable events export.');
+  if (!$('fCustomer').value.trim()) bad('fCustomer', 'Enter the customer name.');
+  if (!(+$('fCredits').value > 0)) bad('fCredits', 'Enter the credits purchased.');
+  if (!$('fStart').value) bad('fStart', 'Enter the term start.');
+  if (!$('fEnd').value) bad('fEnd', 'Enter the term end.');
+  else if ($('fStart').value && $('fEnd').value <= $('fStart').value) bad('fEnd', 'Term end must be after term start.');
+  return ok;
+}
+async function onBuild(){
+  if (!validate()) { const first = document.querySelector('.invalid'); if (first) first.focus(); return; }
+  const btn = $('btnBuild'); btn.disabled = true; const label = btn.textContent; btn.textContent = PENDING ? 'Reading file…' : 'Updating…';
+  let ok = true;
+  if (PENDING) ok = await loadFiles(PENDING);
+  btn.disabled = false; btn.textContent = label;
+  if (!ok) return;
+  saveSettings(); closeModal(false); render(); toast('Dashboard ready');
+}
+
+// ---- example data (fictional) ----
+function loadSample(){
+  const st = newState(); st.sample = true;
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const end = dnum(new Date().toISOString().slice(0,10)) - 1, start = end - 20;
+  const orgs = [
+    ['Platform Engineering','payments-api', {opensource:160, code:120, container:420, iac:14}, {day:13, cap:'container', to:140}],
+    ['Platform Engineering','identity', {opensource:85, code:70, container:120}],
+    ['Platform Engineering','shared-infra', {iac:22, container:60}],
+    ['Retail Apps','storefront-web', {opensource:140, code:110, container:90}],
+    ['Retail Apps','mobile-app', {opensource:95, code:80}, {day:9, cap:'opensource', to:130}],
+    ['Retail Apps','loyalty', {opensource:40, code:35, container:30}],
+    ['Data & AI','ml-pipelines', {opensource:60, code:45, container:210}],
+    ['Data & AI','analytics', {opensource:30, code:25}],
+  ];
+  const repos = ['checkout','ledger','gateway','auth-service','catalog','search','cart','notifications','ui-kit','etl-jobs','feature-store'];
+  let eid = 0;
+  for (let dn = start; dn <= end; dn++) {
+    const d = dstr(dn); const i = dn - start;
+    for (const [g,o,base,step] of orgs) {
+      for (const c in base) {
+        let n = base[c]; if (step && step.cap === c && i >= step.day) n = step.to;
+        n = Math.max(0, Math.round(n * (0.97 + rnd()*0.05)));
+        const key = d+'\u0001'+g+'\u0001'+o+'\u0001'+c; st.bill.set(key, n); eid += n;
+      }
+      if (!st.orgs.has(o)) st.orgs.set(o, {id:o, name:o, slug:o, group:g}); st.groups.add(g);
+      for (let t = 0; t < 6; t++) {
+        const repo = 'example-co/' + o + '-' + repos[(t*3 + o.length) % repos.length];
+        const capk = ['opensource','code','container','opensource','iac','opensource'][t];
+        if (!base[capk]) continue;
+        const br = t === 3 ? 'feature/new-checkout' : 'main';
+        const name = capk === 'container' ? `123456789012.dkr.ecr.eu-west-1.amazonaws.com/${o}/${repos[t]}:v1.${i%5}` : capk === 'code' ? `${repo}(${br})` : `${repo}(${br}):${capk==='iac'?'terraform/main.tf':'package.json'}`;
+        const pid = o+'-'+t+(capk==='container' ? '-'+(i%5) : '');
+        let p = st.tests.get(pid); if (!p) { p = {pid, name, url:'', org:o, group:g, cap:capk, n:0, flows:{}, first:d, last:d}; st.tests.set(pid, p); }
+        const flow = rnd() < 0.75 ? 'recurring' : rnd() < 0.7 ? 'web-test' : 'cli';
+        p.n++; p.flows[flow] = (p.flows[flow]||0)+1; p.last = d + ' 06:30:00';
+        const k = d+'\u0001'+g+'\u0001'+o+'\u0001'+capk+'\u0001'+flow; st.testDaily.set(k, (st.testDaily.get(k)||0)+1);
+      }
+    }
+  }
+  st.billMin = dstr(start); st.billMax = dstr(end); st.allMin = st.billMin; st.allMax = st.billMax; st.rows = eid; st.files = ['Demo data, 21 days'];
+  finalize(st); ST = st;
+  $('fCustomer').value = 'Example Co (fictional)'; $('fCredits').value = 600000; $('fPrice').value = '';
+  $('fStart').value = dstr(start - 60); $('fEnd').value = dstr(start - 60 + 365); $('fAsOf').value = dstr(end + 1);
+  
+  fillFilters(); render();
+}
+
+function fillFilters(){
+  const gs = [...ST.groups].sort(); const caps = CAP_ORDER.filter(c => ST.billArr.some(x=>x.c===c) || ST.projArr.some(p=>p.cap===c));
+  $('fGroup').innerHTML = '<option value="">All groups</option>' + gs.map(g => `<option>${esc(g)}</option>`).join('');
+  $('fCap').innerHTML = '<option value="">All capabilities</option>' + caps.map(c => `<option value="${c}">${esc(CAPS[c].label)}</option>`).join('');
+}
+
+// ---- render ----
+function render(){
+  if (!ST) return;
+  const s = settings(); const f = {group:$('fGroup').value, cap:$('fCap').value};
+  MODEL = compute(ST, s, f); const m = MODEL;
+  $('banner').innerHTML = ST.sample ? `<div class="banner sample"><b>Demo data.</b>&nbsp;A fictional account generated for illustration. Choose <b>Load billing data</b> to upload a tenant's billable events export.</div>` : '';
+  $('filterNote').textContent = 'Filtered view. Projections compare this slice with the whole account\'s purchased credits.'; $('filterNote').hidden = !(f.group || f.cap);
+  $('ctxText').innerHTML = `<b>${esc($('fCustomer').value || 'Unnamed account')}</b>${m.ent ? `<span>${F(m.ent)} credits</span>` : '<span>Credits not set</span>'}${s.start && s.end ? `<span>${fdate(s.start)} – ${fdate(s.end)}</span>` : ''}${m.asOf != null ? `<span>as of ${fdate(dstr(m.asOf))}</span>` : ''}<span>${esc(ST.files.join(', '))}</span>`;
+  $('btnEdit').textContent = ST.sample ? 'Use my data' : 'Edit contract';
+  renderMeter(m); renderKpis(m); renderKpis2(m); renderCum(m); renderDaily(m); renderDup(m); renderDonut(m); renderCaps(m); renderInsights(m); renderTab(); renderRateCard();
+  $('footInfo').textContent = `${F(ST.rows)} events · ${F(ST.billArr.reduce((a,x)=>a+x.n,0))} billable unit-days · ${F(ST.tests.size)} projects tested`;
+  $('btnExport').hidden = !downloads;
+}
+function renderMeter(m){
+  const sc = m.score;
+  $('scoreVal').innerHTML = sc == null ? '–' : `${F(sc, sc < 10 ? 1 : 0)}<small>%</small>`;
+  $('scorePill').innerHTML = m.band ? `<span class="pill ${m.band.k}">${esc(m.band.t)}</span>` : `<span class="pill info">Add credits purchased</span>`;
+  $('scoreNote').textContent = sc == null ? 'Enter the credits purchased and term to score this account.' : `Projected credits at term end as a share of ${F(m.ent)} purchased.`;
+  $('meterBasis').textContent = `run-rate ${F(m.rate)} credits/day (${m.W===1?'latest day':m.W+'-day avg'})`;
+  const max = Math.max(m.ent, m.projRun, m.projLinear||0, 1) * 1.04; const pct = v => Math.min(100, v/max*100);
+  let h = '';
+  if (m.ent && m.projRun > m.ent) h += `<div class="seg over" style="width:${pct(m.projRun)}%"></div>`;
+  h += `<div class="seg proj" style="width:${pct(Math.min(m.projRun, m.ent || m.projRun))}%"></div>`;
+  h += `<div class="seg used" style="width:${Math.max(.4, pct(m.used))}%"></div>`;
+  if (m.projLinear != null) h += `<div class="tick snyk down" style="left:${pct(m.projLinear)}%"><span>Snyk ${FK(m.projLinear)}</span></div>`;
+  h += `<div class="tick up" style="left:${pct(m.projRun)}%;background:var(--accent)"><span>Run-rate ${FK(m.projRun)}</span></div>`;
+  if (m.ent) h += `<div class="tick ent ${Math.abs(pct(m.ent)-pct(m.projRun))<12?'down':'up'}" style="left:${pct(m.ent)}%"><span style="${pct(m.ent)>88?'transform:translateX(-100%)':''}">Purchased ${FK(m.ent)}</span></div>`;
+  $('meterBar').innerHTML = h;
+}
+function renderKpis(m){
+  const k = [
+    ['Credits used', F(m.used), m.ent ? `${F(m.used/m.ent*100, 2)}% of ${FK(m.ent)}` : `${m.days.length} metered days`],
+    ['Daily run-rate', F(m.rate), m.evenPace ? `${F(m.rate/m.evenPace*100)}% of even pace (${F(m.evenPace)})` : 'credits/day'],
+    ['Projected at term end', FK(m.projRun), `latest day basis ${FK(m.projLatest)}`],
+    m.overage > 0 ? ['Overage', FK(m.overage), m.price ? `≈ ${F(m.overage*m.price)} at ${m.price}/credit` : 'credits invoiced on demand'] : ['Unused at term end', FK(m.unused), m.price ? `≈ ${F(m.unused*m.price)} expires` : 'credits would expire'],
+    m.exhaust ? ['Credits run out', fdate(m.exhaust), 'at current run-rate'] : ['Needed to use all', F(m.needDaily), 'credits/day from now'],
+    ['Days into term', `${m.daysInto} / ${m.termDays}`, `${m.daysLeft} days left`]
+  ];
+  $('kpis').innerHTML = k.map(([l,v,s]) => `<div class="kpi"><div class="eyebrow">${esc(l)}</div><div class="v" title="${esc(v)}">${esc(v)}</div><div class="s">${esc(s)}</div></div>`).join('');
+}
+function extraKpis(m){
+  const n = m.days.length; if (!n) return null;
+  // trend: latest day vs 7-day average
+  const w7 = m.dailyCredits.slice(Math.max(0, n - 7)); const avg7 = w7.reduce((a,b)=>a+b,0) / w7.length;
+  const trend = n >= 2 && avg7 ? (m.latest - avg7) / avg7 * 100 : null;
+  // week vs plan: last full metered week, else the current week projected
+  let week = null;
+  if (m.ent && m.asOf != null && m.tStart != null) {
+    const daily = new Map(m.days.map((d,i) => [dnum(d), m.dailyCredits[i]])); const met = dnum(ST.billMin);
+    const ws = m.asOf - ((new Date(m.asOf*dayMs).getUTCDay() + 6) % 7); const plan = m.evenPace * 7;
+    const sum = (a,b) => { let t = 0; for (let k = a; k < b; k++) t += daily.get(k) || 0; return t; };
+    if (ws - 7 >= met && ws - 7 >= m.tStart) { const a = sum(ws - 7, ws); week = {start:ws - 7, actual:a, finish:a, plan, pct:a/plan*100, done:true}; }
+    else { const dn = m.asOf - ws, a = sum(ws, m.asOf); const f = a + m.rate * (7 - dn); week = {start:ws, actual:a, finish:f, plan, pct:f/plan*100, done:false, dn}; }
+  }
+  // peak day
+  let pi = 0; m.dailyCredits.forEach((v,i) => { if (v > m.dailyCredits[pi]) pi = i; });
+  // savings: sustained account-level drops per capability (org moves that net out are not savings)
+  const sv = [];
+  for (const c of m.caps) {
+    const u = m.units[c]; const start = n > 2 ? 1 : 0; let pk = start; for (let i = start; i < n; i++) if (u[i] > u[pk]) pk = i;
+    const drop = u[pk] - u[n-1]; if (drop < Math.max(5, 0.2 * u[pk])) continue;
+    const drivers = m.orgRows.filter(o => o.units[c]).map(o => ({name:o.name, d:o.units[c][pk] - o.units[c][n-1]})).filter(x => x.d > 0).sort((a,b) => b.d - a.d);
+    sv.push({org: drivers.length ? drivers[0].name : '', c, from:u[pk], to:u[n-1], cr:drop * rates[c]});
+  }
+  sv.sort((a,b) => b.cr - a.cr); const saved = sv.reduce((a,x) => a + x.cr, 0);
+  return {avg7, trend, week, peak:{d:m.days[pi], v:m.dailyCredits[pi]}, saved, sv};
+}
+function renderKpis2(m){
+  const x = extraKpis(m); m.extra = x; if (!x) { $('kpis2').innerHTML = ''; return; }
+  const cls = p => p >= 85 && p <= 110 ? 'ok' : p < 85 ? 'bad' : 'warnc';
+  const t = x.trend; const tCls = t == null ? '' : Math.abs(t) < 5 ? 'ok' : t < 0 ? 'bad' : 'warnc';
+  const tWord = t == null ? '' : Math.abs(t) < 5 ? 'steady' : t < 0 ? 'falling' : 'rising';
+  const tiles = [
+    ['Trend vs 7-day average', t == null ? '–' : `${t > 0 ? '+' : t < 0 ? '−' : ''}${F(Math.abs(t),1)}%`,
+      t == null ? 'needs 2+ days of data' : `<span class="${tCls}">${tWord}</span> · latest ${F(m.latest)} vs avg ${F(x.avg7)}`],
+    [x.week && x.week.done ? 'Last full week vs plan' : 'This week vs plan', x.week ? `${F(x.week.pct)}%` : '–',
+      !x.week ? 'enter credits and term' : x.week.done
+        ? `<span class="${cls(x.week.pct)}">${F(x.week.actual)}</span> of ${F(x.week.plan)} planned · wk of ${fdShort(x.week.start)}`
+        : `<span class="${cls(x.week.pct)}">heading for ${F(x.week.finish)}</span> of ${F(x.week.plan)} · ${x.week.dn} of 7 days in`],
+    ['Peak day', F(x.peak.v), `${fdate(x.peak.d)}${m.evenPace ? ` · ${F(x.peak.v / m.evenPace * 100)}% of even pace` : ''}`],
+    ['Savings from cleanup', x.saved ? `${F(x.saved)}/day` : '0',
+      x.saved ? `<span class="ok">≈ ${FK(x.saved * m.daysLeft)} over the rest of the term</span> · ${x.sv.slice(0,2).map(v => `${esc(CAPS[v.c].label)} ${F(v.from)}→${F(v.to)} ${esc(CAPS[v.c].unitShort)}${v.org ? ' (mostly ' + esc(v.org) + ')' : ''}`).join(', ')}` : 'no sustained account-level drops yet']
+  ];
+  $('kpis2').innerHTML = tiles.map(([l,v,sub]) => `<div class="kpi"><div class="eyebrow">${esc(l)}</div><div class="v" title="${esc(v)}">${esc(v)}</div><div class="s">${sub}</div></div>`).join('');
+}
+function nice(max){ if (max <= 0) return [0,1]; const e = Math.pow(10, Math.floor(Math.log10(max))); const st = [1,2,2.5,5,10].map(x=>x*e).find(x => max/x <= 5) || 10*e; return [Math.ceil(max/st)*st, st]; }
+let GRAN = 'week';
+function burnBuckets(m){
+  const startN = m.tStart, endN = m.tStart + m.termDays;
+  const first = ST.billMin ? Math.max(startN, dnum(ST.billMin)) : startN;
+  const bStart = n => { const d = new Date(n*dayMs); return GRAN === 'week' ? n - ((d.getUTCDay()+6)%7) : Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)/dayMs; };
+  const bNext = n => { if (GRAN === 'week') return n + 7; const d = new Date(n*dayMs); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth()+1, 1)/dayMs; };
+  const daily = new Map(m.days.map((d,i) => [dnum(d), m.dailyCredits[i]]));
+  const out = [];
+  for (let s = bStart(first); s < endN; s = bNext(s)) {
+    const lo = Math.max(s, startN), hi = Math.min(bNext(s), endN);
+    let actual = 0; for (let n = lo; n < Math.min(hi, m.asOf); n++) actual += daily.get(n) || 0;
+    const futDays = Math.max(0, hi - Math.max(lo, m.asOf));
+    out.push({s, lo, hi, actual, proj: m.rate * futDays, plan: m.evenPace * (hi - lo), need: m.needDaily * futDays, futDays, days: hi - lo, past: hi <= m.asOf});
+  }
+  return out;
+}
+const fdShort = n => new Date(n*dayMs).toLocaleDateString('en-US',{month:'short', day:'numeric', timeZone:'UTC'});
+function renderCum(m){
+  const el = $('cumChart');
+  if (m.tStart == null || !m.days.length) { el.innerHTML = '<p class="muted">Load data and enter the term to draw this chart.</p>'; $('burnNote').innerHTML = ''; return; }
+  const per = GRAN === 'week' ? 'week' : 'month';
+  const B = burnBuckets(m).filter(b => b.lo < m.asOf);
+  B.forEach(b => { b.finish = b.actual + b.proj; b.pct = b.plan ? b.finish / b.plan * 100 : null; b.current = !b.past; });
+  const n = B.length;
+  const W = 560, H = 260, L = 52, R = 10, Tp = 26, Bt = 28, iw = W-L-R, ih = H-Tp-Bt;
+  const [ymax, step] = nice(Math.max(1, ...B.map(b => Math.max(b.finish, b.plan))) * 1.12);
+  const y = v => Tp + ih - v/ymax*ih; const bw = iw / Math.max(n, 4); const w = Math.min(64, bw * 0.56);
+  const lab = b => GRAN === 'week' ? 'Wk ' + fdShort(b.lo) : new Date(b.lo*dayMs).toLocaleDateString('en-US',{month:'short', year: n > 10 ? '2-digit' : undefined, timeZone:'UTC'});
+  const sev = p => p == null ? 'muted' : p >= 85 && p <= 110 ? 'ok' : p < 85 ? 'bad' : 'warnc';
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Credits used per ${per} against plan"><defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--accent)" fill-opacity=".14"/><rect width="2.5" height="6" fill="var(--accent)" fill-opacity=".45"/></pattern></defs>`;
+  for (let v = 0; v <= ymax + 1e-9; v += step) s += `<line class="gl" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L-6}" y="${y(v)+3.5}" text-anchor="end">${FK(v)}</text>`;
+  const every = Math.ceil(n / 10); let hits = '';
+  B.forEach((b, i) => {
+    const cx = L + i*bw + bw/2, x0 = cx - w/2;
+    s += `<g class="col" data-i="${i}">`;
+    if (b.actual > 0) s += `<rect x="${x0.toFixed(1)}" y="${y(b.actual).toFixed(1)}" width="${w.toFixed(1)}" height="${(y(0)-y(b.actual)).toFixed(1)}" fill="var(--accent)" rx="2"/>`;
+    if (b.proj > 0) s += `<rect x="${x0.toFixed(1)}" y="${y(b.finish).toFixed(1)}" width="${w.toFixed(1)}" height="${(y(b.actual)-y(b.finish)).toFixed(1)}" fill="url(#hatch)" stroke="var(--accent)" stroke-opacity=".5" stroke-dasharray="3 2" rx="2"/>`;
+    if (m.ent) { const pw = Math.min(bw * 0.86, w + 18); s += `<line x1="${(cx - pw/2).toFixed(1)}" x2="${(cx + pw/2).toFixed(1)}" y1="${y(b.plan).toFixed(1)}" y2="${y(b.plan).toFixed(1)}" stroke="var(--good)" stroke-width="2.4" stroke-linecap="round"/>`; }
+    if (b.pct != null) s += `<text class="pct ${sev(b.pct)}" x="${cx.toFixed(1)}" y="${(Math.min(y(b.finish), y(b.plan)) - 7).toFixed(1)}" text-anchor="middle">${F(b.pct)}%${b.current ? '*' : ''}</text>`;
+    s += `</g>`;
+    if (i % every === 0 || i === n-1) s += `<text x="${cx.toFixed(1)}" y="${H-9}" text-anchor="middle">${lab(b)}</text>`;
+    hits += `<rect class="hit" data-i="${i}" x="${(L + i*bw).toFixed(1)}" y="${Tp - 20}" width="${bw.toFixed(1)}" height="${ih + 20}" fill="transparent" tabindex="0"/>`;
+  });
+  s += hits + '</svg>'; el.innerHTML = s;
+  attachTip(el.parentElement, el.querySelector('svg'), i => burnTip(m, B[i]));
+  // plain-language headline
+  const done = B.filter(b => b.past && b.actual > 0); const cur = B.find(b => b.current); const ref = done.length ? done[done.length-1] : cur;
+  let h = '';
+  if (ref && m.ent) {
+    const name = GRAN === 'week' ? `Week of ${fdShort(ref.lo)}` : new Date(ref.lo*dayMs).toLocaleDateString('en-US',{month:'long', timeZone:'UTC'});
+    h = ref.past
+      ? `<b>${name}:</b> ${F(ref.actual)} credits used against ${F(ref.plan)} planned <b class="${sev(ref.pct)}">(${F(ref.pct)}% of plan)</b>.`
+      : `<b>${name} (in progress):</b> ${F(ref.actual)} used so far, heading for ${F(ref.finish)} against ${F(ref.plan)} planned <b class="${sev(ref.pct)}">(${F(ref.pct)}%)</b>.`;
+    h += ` To use every purchased credit, the account needs <b>${F(m.needDaily * (GRAN==='week'?7:30.44))}</b> credits per ${per} from today.`;
+  }
+  $('burnNote').innerHTML = h;
+}
+function burnTip(m, b){
+  const head = GRAN === 'week' ? `Week of ${fdShort(b.lo)} – ${fdShort(b.hi-1)}` : new Date(b.lo*dayMs).toLocaleDateString('en-US',{month:'long', year:'numeric', timeZone:'UTC'});
+  const gap = b.finish - b.plan; const actDays = Math.max(0, Math.min(b.hi, m.asOf) - b.lo);
+  const row = (k, v, cls='') => `<tr class="${cls}"><td>${k}</td><td class="n">${v}</td></tr>`;
+  const metStart = ST.billMin ? dnum(ST.billMin) : null; const pre = metStart != null && metStart > b.lo && metStart < b.hi;
+  return `<div class="tip-h"><span>${esc(head)}</span><span class="chip">${b.past ? 'Complete' : 'In progress'}</span></div>
+    <div class="tip-big num">${F(b.pct)}%<small> of plan${b.current ? ' if the current pace holds' : ''}</small></div>
+    <table class="tip-t"><tbody>
+    ${row('<span class="dot" style="background:var(--accent)"></span>Used' + (b.current ? ' so far (' + actDays + ' days)' : ''), F(b.actual))}
+    ${b.proj ? row('<span class="dot" style="background:color-mix(in srgb, var(--accent) 40%, transparent)"></span>Expected for the remaining ' + b.futDays + ' days', F(b.proj)) : ''}
+    ${b.proj ? row('Expected total', '<b>' + F(b.finish) + '</b>') : ''}
+    ${row('<span class="dot" style="background:var(--good)"></span>Plan for this ' + (GRAN === 'week' ? 'week' : 'month'), F(b.plan))}
+    ${row(gap < 0 ? 'Short of plan' : 'Above plan', `<b class="${gap < 0 ? 'bad' : 'ok'}">${gap < 0 ? '−' : '+'}${F(Math.abs(gap))}</b>`, 'sum')}
+    ${row('Average per day', F(actDays ? b.actual / actDays : 0) + ' <span class="muted">vs ' + F(m.evenPace) + ' plan</span>')}
+    </tbody></table>
+    ${pre ? `<div class="tip-f">Metering started on ${fdShort(metStart)}, so days before it count as zero.</div>` : ''}`;
+}
+function attachTip(container, svg, html){
+  if (!svg) return;
+  let tip = container.querySelector(':scope > .tip');
+  if (!tip) { tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true; tip.setAttribute('role','tooltip'); container.appendChild(tip); }
+  const show = el => {
+    const i = +el.dataset.i; tip.innerHTML = html(i); tip.hidden = false;
+    svg.classList.add('hovering'); svg.querySelectorAll('.col').forEach(c => c.classList.toggle('on', +c.dataset.i === i));
+    svg.querySelectorAll('.hit').forEach(h => h.classList.toggle('on', h === el));
+    const cr = container.getBoundingClientRect(), r = el.getBoundingClientRect(); const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = r.right - cr.left + 10; if (left + tw > cr.width - 6) left = r.left - cr.left - tw - 10; if (left < 6) left = Math.max(6, (cr.width - tw) / 2);
+    let top = r.top - cr.top + 6; if (top + th > cr.height - 6) top = Math.max(6, cr.height - th - 6);
+    tip.style.left = left + 'px'; tip.style.top = top + 'px';
+  };
+  const hide = () => { tip.hidden = true; svg.classList.remove('hovering'); svg.querySelectorAll('.on').forEach(c => c.classList.remove('on')); };
+  svg.querySelectorAll('.hit').forEach(h => { h.addEventListener('mouseenter', () => show(h)); h.addEventListener('click', () => show(h)); h.addEventListener('focus', () => show(h)); h.addEventListener('blur', hide); });
+  svg.addEventListener('mouseleave', hide);
+}
+let DGRAN = 'day';
+function timeBuckets(m){
+  const out = [], idx = new Map();
+  m.days.forEach((d, i) => {
+    const n = dnum(d); let k, start;
+    if (DGRAN === 'day') { k = d; start = n; }
+    else if (DGRAN === 'week') { start = n - ((new Date(n*dayMs).getUTCDay() + 6) % 7); k = 'w' + start; }
+    else { k = d.slice(0,7); start = dnum(k + '-01'); }
+    if (!idx.has(k)) { idx.set(k, out.length); out.push({k, start, idx:[], units:{}, cap:{}, total:0}); }
+    const b = out[idx.get(k)]; b.idx.push(i);
+    m.caps.forEach(c => { const u = m.units[c][i]; b.units[c] = (b.units[c]||0) + u; b.cap[c] = (b.cap[c]||0) + u*rates[c]; b.total += u*rates[c]; });
+  });
+  out.forEach(b => { b.days = b.idx.length; const sd = new Date(b.start*dayMs);
+    b.span = DGRAN === 'day' ? 1 : DGRAN === 'week' ? 7 : new Date(Date.UTC(sd.getUTCFullYear(), sd.getUTCMonth()+1, 0)).getUTCDate(); b.avg = b.total / b.days; });
+  return out;
+}
+function bucketLabel(b, long){
+  if (DGRAN === 'day') return long ? new Date(b.start*dayMs).toLocaleDateString('en-US',{weekday:'short', month:'short', day:'numeric', year:'numeric', timeZone:'UTC'}) : fdShort(b.start);
+  if (DGRAN === 'week') return long ? `Week of ${fdShort(b.start)} – ${fdShort(b.start + 6)}` : fdShort(b.start);
+  return monthName(b.k, long);
+}
+function renderDaily(m){
+  const el = $('dailyChart'); const nd = m.days.length;
+  const unit = {day:'day', week:'week', month:'month'}[DGRAN];
+  if (!nd) { el.innerHTML = '<p class="muted">No billable events in this view.</p>'; $('capLegend').innerHTML = ''; $('dailyNote').textContent = ''; return; }
+  const B = timeBuckets(m); const n = B.length;
+  const W = 560, H = 270, L = 46, R = 8, Tp = 22, Bt = 26, iw = W-L-R, ih = H-Tp-Bt;
+  const [ymax, step] = nice(Math.max(...B.map(b => b.total)) * 1.06); const y = v => Tp + ih - v/ymax*ih;
+  const slots = Math.max(n, DGRAN === 'day' ? 1 : 3); const bw = iw / slots; const off = (iw - bw*n) / 2;
+  const w = Math.min(DGRAN === 'day' ? 1e9 : 110, Math.max(1, bw - Math.max(1, Math.min(10, bw * 0.28))));
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Credits per ${unit} by capability">`;
+  for (let v = 0; v <= ymax + 1e-9; v += step) s += `<line class="gl" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L-6}" y="${y(v)+3.5}" text-anchor="end">${FK(v)}</text>`;
+  const every = Math.ceil(n / 8); let hits = '';
+  B.forEach((b, i) => {
+    let acc = 0; const cx = L + off + i*bw + bw/2, x0 = cx - w/2;
+    s += `<g class="col" data-i="${i}">`;
+    const segs = m.caps.filter(c => b.cap[c] > 0);
+    segs.forEach((c, k) => { const v = b.cap[c]; const yt = y(acc + v), hgt = y(acc) - yt;
+      s += k === segs.length - 1 && hgt > 3 && w > 6
+        ? `<path d="M${x0.toFixed(1)},${y(acc).toFixed(1)}V${(yt+3).toFixed(1)}q0,-3 3,-3H${(x0+w-3).toFixed(1)}q3,0 3,3V${y(acc).toFixed(1)}Z" fill="${capColor(c)}"/>`
+        : `<rect x="${x0.toFixed(1)}" y="${yt.toFixed(1)}" width="${w.toFixed(1)}" height="${hgt.toFixed(1)}" fill="${capColor(c)}"/>`;
+      acc += v; });
+    if (n <= 16) s += `<text class="val" x="${cx.toFixed(1)}" y="${(y(b.total) - 6).toFixed(1)}" text-anchor="middle">${FK(b.total)}</text>`;
+    s += `</g>`;
+    if (i % every === 0 || i === n-1) s += `<text x="${cx.toFixed(1)}" y="${H-8}" text-anchor="middle">${bucketLabel(b)}</text>`;
+    hits += `<rect class="hit" data-i="${i}" x="${(L + off + i*bw).toFixed(1)}" y="${Tp - 16}" width="${bw.toFixed(1)}" height="${ih + 16}" fill="transparent" tabindex="0" aria-label="${esc(bucketLabel(b, true))}: ${F(b.total,2)} credits"/>`;
+  });
+  s += hits + '</svg>'; el.innerHTML = s;
+  attachTip(el.closest('.panel'), el.querySelector('svg'), i => bucketTip(m, B, i));
+  $('dailyNote').textContent = `${fdate(m.days[0])} – ${fdate(m.days[nd-1])} · hover a ${unit} for detail`;
+  $('capLegend').innerHTML = m.caps.map(c => `<span><i style="background:${capColor(c)}"></i>${esc(CAPS[c].label)}</span>`).join('');
+}
+function bucketTip(m, B, i){
+  const b = B[i], p = i ? B[i-1] : null; const day = DGRAN === 'day';
+  const val = day ? b.total : b.avg, pv = p ? (day ? p.total : p.avg) : null; const dl = pv != null ? val - pv : null;
+  const partial = day ? (i === 0 && B.length > 2 && b.total < 0.7 * B[1].total) : b.days < b.span;
+  const capRows = m.caps.map(c => {
+    const u = day ? (b.units[c]||0) : (b.units[c]||0) / b.days; const pu = p ? (day ? (p.units[c]||0) : (p.units[c]||0) / p.days) : null;
+    const du = pu != null ? u - pu : null; const cr = b.cap[c] || 0;
+    return `<tr><td><span class="dot" style="background:${capColor(c)}"></span>${esc(CAPS[c].label)}</td><td class="n">${F(u)} <span class="muted">${esc(CAPS[c].unitShort)}${day ? '' : '/day'}</span>${du && Math.round(du) ? ` <span class="${du < 0 ? 'ok' : 'bad'}">${du > 0 ? '+' : '−'}${F(Math.abs(du))}</span>` : ''}</td><td class="n muted">× ${F(rates[c],2)}</td><td class="n"><b>${F(cr,2)}</b></td><td class="n muted">${b.total ? F(cr/b.total*100) : 0}%</td></tr>`; }).join('');
+  const orgs = [...m.byOrg.values()].map(o => [o.name, b.idx.reduce((a,k) => a + (o.daily[k]||0), 0)]).filter(x => x[1] > 0).sort((a,c) => c[1] - a[1]);
+  const orgRows = orgs.slice(0,5).map(([nm, v]) => `<tr><td class="org">${esc(nm)}</td><td class="n">${F(v,1)}</td><td class="n muted">${b.total ? F(v/b.total*100) : 0}%</td></tr>`).join('');
+  const plan = m.evenPace * b.days;
+  return `<div class="tip-h"><span>${esc(bucketLabel(b, true))}</span>${partial ? `<span class="chip warn">${day ? 'Partial day' : `${b.days} of ${b.span} days metered`}</span>` : ''}</div>
+    <div class="tip-big num">${F(b.total,2)}<small> credits${day ? '' : ` · ${F(b.avg)}/day avg`}</small>${dl != null ? ` <span class="${dl <= 0 ? 'ok' : 'bad'} tip-d">${dl > 0 ? '▲ +' : '▼ −'}${F(Math.abs(dl),1)}${day ? '' : '/day'} (${pv ? F(Math.abs(dl)/pv*100,1) : '–'}%)</span>` : ''}</div>
+    <table class="tip-t"><thead><tr><th>Capability</th><th class="n">${day ? 'Units' : 'Avg units'}</th><th class="n">Rate</th><th class="n">Credits</th><th class="n">Share</th></tr></thead><tbody>${capRows}</tbody></table>
+    ${orgRows ? `<div class="tip-sub">Top orgs <span class="muted">(${F(orgs.length)} billed)</span></div><table class="tip-t"><tbody>${orgRows}</tbody></table>` : ''}
+    ${m.evenPace ? `<div class="tip-f">Plan for ${b.days} metered day${b.days > 1 ? 's' : ''}: ${F(plan)} · this ${DGRAN} ${F(b.total/plan*100)}% of plan</div>` : ''}`;
+}
+function monthBuckets(m){
+  const months = [], idx = new Map();
+  m.days.forEach((d, i) => {
+    const k = d.slice(0,7);
+    if (!idx.has(k)) { idx.set(k, months.length); months.push({k, days:0, total:0, cap:{}, units:{}}); }
+    const mo = months[idx.get(k)]; mo.days++;
+    m.caps.forEach(c => { const u = m.units[c][i]; mo.units[c] = (mo.units[c]||0) + u; mo.cap[c] = (mo.cap[c]||0) + u*rates[c]; mo.total += u*rates[c]; });
+  });
+  return months;
+}
+const monthName = (k, long) => new Date(k + '-01T00:00:00Z').toLocaleDateString('en-US', {month: long ? 'long' : 'short', year:'numeric', timeZone:'UTC'});
+function renderMonthly(m){
+  const el = $('monthChart');
+  if (!m.days.length) { el.innerHTML = '<p class="muted">No billable events in this view.</p>'; $('monthLegend').innerHTML = ''; return; }
+  const M = monthBuckets(m); const n = M.length;
+  const W = 560, H = 260, L = 52, R = 10, Tp = 22, Bt = 28, iw = W-L-R, ih = H-Tp-Bt;
+  const [ymax, step] = nice(Math.max(...M.map(x => x.total)) * 1.08); const y = v => Tp + ih - v/ymax*ih;
+  const bw = iw / Math.max(n, 3); const w = Math.min(110, bw * 0.62);
+  const off = n < 3 ? (iw - bw*n) / 2 : 0;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Credits per billing month by capability">`;
+  for (let v = 0; v <= ymax + 1e-9; v += step) s += `<line class="gl" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L-6}" y="${y(v)+3.5}" text-anchor="end">${FK(v)}</text>`;
+  let hits = '';
+  M.forEach((mo, i) => {
+    const cx = L + off + i*bw + bw/2, x0 = cx - w/2; let acc = 0;
+    s += `<g class="col" data-i="${i}">`;
+    const segs = m.caps.filter(c => mo.cap[c] > 0);
+    segs.forEach((c, k) => { const v = mo.cap[c]; const yt = y(acc+v), hgt = y(acc) - yt;
+      s += k === segs.length - 1 && hgt > 3
+        ? `<path d="M${x0.toFixed(1)},${y(acc).toFixed(1)}V${(yt+3).toFixed(1)}q0,-3 3,-3H${(x0+w-3).toFixed(1)}q3,0 3,3V${y(acc).toFixed(1)}Z" fill="${capColor(c)}"/>`
+        : `<rect x="${x0.toFixed(1)}" y="${yt.toFixed(1)}" width="${w.toFixed(1)}" height="${hgt.toFixed(1)}" fill="${capColor(c)}"/>`;
+      acc += v; });
+    s += `<text class="val" x="${cx.toFixed(1)}" y="${(y(mo.total) - 6).toFixed(1)}" text-anchor="middle">${F(mo.total)}</text></g>`;
+    s += `<text x="${cx.toFixed(1)}" y="${H-9}" text-anchor="middle">${monthName(mo.k)}</text>`;
+    hits += `<rect class="hit" data-i="${i}" x="${(L + off + i*bw).toFixed(1)}" y="${Tp - 16}" width="${bw.toFixed(1)}" height="${ih + 16}" fill="transparent" tabindex="0"/>`;
+  });
+  s += hits + '</svg>'; el.innerHTML = s;
+  attachTip(el.closest('.panel'), el.querySelector('svg'), i => monthTip(m, M[i]));
+  $('monthLegend').innerHTML = CAP_ORDER.map(c => `<span style="${m.caps.includes(c) ? '' : 'opacity:.5'}"><i style="background:${capColor(c)}"></i>${esc(CAPS[c].label)}</span>`).join('');
+}
+function monthTip(m, mo){
+  const rows = m.caps.map(c => `<tr><td><span class="dot" style="background:${capColor(c)}"></span>${esc(CAPS[c].label)}</td><td class="n">${F(mo.units[c]||0)} <span class="muted">unit-days</span></td><td class="n"><b>${F(mo.cap[c]||0,2)}</b></td><td class="n muted">${mo.total ? F((mo.cap[c]||0)/mo.total*100,1) : 0}%</td></tr>`).join('');
+  return `<div class="tip-h"><span>${esc(monthName(mo.k, true))}</span><span class="chip">${mo.days} metered days</span></div>
+    <div class="tip-big num">${F(mo.total,2)}<small> credits · ${F(mo.total/mo.days)}/day avg</small></div>
+    <table class="tip-t"><thead><tr><th>Capability</th><th class="n">Units</th><th class="n">Credits</th><th class="n">Share</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function reattribution(m){
+  // org-level jumps in contributor capabilities compared with the account total on the same day
+  const ev = [];
+  for (const o of m.orgRows) for (const c in o.units) {
+    if (CAPS[c].unit !== 'Active contributor') continue; const u = o.units[c];
+    for (let i = 2; i < u.length; i++) { const d = u[i] - u[i-1]; if (Math.abs(d) < 20) continue;
+      const acc = m.units[c][i] - m.units[c][i-1]; if (Math.abs(acc) <= Math.abs(d) * 0.5) ev.push({org:o.name, c, day:m.days[i], d, acc}); }
+  }
+  return ev.sort((a,b) => Math.abs(b.d) - Math.abs(a.d));
+}
+function renderDup(m){
+  const d = m.dups;
+  if (!d || !d.totalTests) { $('dupKpis').innerHTML = '<div><div class="s">No repository-level scans in this view.</div></div>'; $('dupNote').innerHTML = ''; return; }
+  const perDay = d.dupTests / Math.max(1, m.days.length);
+  const k = [
+    ['Duplicate repos', F(d.multiOrg), `imported in 2+ orgs · ${F(d.crossGroup)} across groups`, ''],
+    ['Duplicate projects', F(d.dupProjects), 'extra copies of the same scan', ''],
+    ['Repeated tests', `${F(perDay)}/day`, `${F(d.share*100,1)}% of repository tests`, ''],
+    ['Credits saved by scanning once', '0/day', 'each contributor and image is billed once account-wide', 'zero']
+  ];
+  $('dupKpis').innerHTML = k.map(([l,v,s2,c]) => `<div><div class="eyebrow">${esc(l)}</div><div class="v ${c}">${esc(v)}</div><div class="s">${esc(s2)}</div></div>`).join('');
+  const ev = reattribution(m).slice(0, 2);
+  const sign = n => (n > 0 ? '+' : n < 0 ? '−' : '') + F(Math.abs(n));
+  let h = '';
+  if (ev.length) h += `<span><b>Proof from this data:</b> ${ev.map(e => `on ${fdShort(dnum(e.day))}, ${esc(e.org)} ${esc(CAPS[e.c].label)} changed by ${sign(e.d)} contributors but the account total moved only ${sign(e.acc)}`).join('; ')}. The same people were billed once, through whichever org still scanned them.</span>`;
+  h += `<span><b>What removing duplicates saves:</b> about ${F(perDay)} tests a day and duplicate findings across orgs. To lower credits, stop monitoring repos or contributors that should not be counted at all, and archive unused container images.</span>`;
+  $('dupNote').innerHTML = h;
+}
+function renderDonut(m){
+  const el = $('donutChart'); const tot = m.used;
+  const S = 220, cx = 110, cy = 110, r0 = 100, r1 = 62;
+  const slices = m.capRows.filter(r => r.credits > 0);
+  let s = `<svg viewBox="0 0 ${S} ${S}" role="img" aria-label="Share of credits by capability">`;
+  if (!tot) s += `<circle cx="${cx}" cy="${cy}" r="${(r0+r1)/2}" fill="none" stroke="var(--line)" stroke-width="${r0-r1}"/>`;
+  let a = -Math.PI/2; let hits = '';
+  const pt = (rr, ang) => `${(cx + rr*Math.cos(ang)).toFixed(2)},${(cy + rr*Math.sin(ang)).toFixed(2)}`;
+  slices.forEach((r, i) => {
+    const sweep = r.credits / tot * Math.PI * 2; const b = a + sweep;
+    let d;
+    if (sweep >= Math.PI*2 - 1e-6) d = `M${cx-r0},${cy}a${r0},${r0} 0 1,0 ${r0*2},0a${r0},${r0} 0 1,0 ${-r0*2},0M${cx-r1},${cy}a${r1},${r1} 0 1,1 ${r1*2},0a${r1},${r1} 0 1,1 ${-r1*2},0Z`;
+    else { const lg = sweep > Math.PI ? 1 : 0; d = `M${pt(r0,a)}A${r0},${r0} 0 ${lg},1 ${pt(r0,b)}L${pt(r1,b)}A${r1},${r1} 0 ${lg},0 ${pt(r1,a)}Z`; }
+    hits += `<path class="col hit slice" data-i="${i}" d="${d}" style="fill:${capColor(r.c)}" stroke="var(--surface)" stroke-width="1.5" fill-rule="evenodd" tabindex="0"/>`;
+    a = b;
+  });
+  s += hits + `<text class="dc-big" x="${cx}" y="${cy+4}" text-anchor="middle">${FK(tot)}</text><text class="dc-sm" x="${cx}" y="${cy+20}" text-anchor="middle">credits used</text></svg>`;
+  el.innerHTML = s;
+  attachTip(el.closest('.panel'), el.querySelector('svg'), i => { const r = slices[i];
+    return `<div class="tip-h"><span><span class="dot" style="background:${capColor(r.c)}"></span>${esc(r.label)}</span><span class="chip">${F(r.share*100,2)}%</span></div>
+      <div class="tip-big num">${F(r.credits,2)}<small> credits</small></div>
+      <table class="tip-t"><tbody>
+      <tr><td>Unit-days billed</td><td class="n">${F(r.unitDays)}</td></tr>
+      <tr><td>Rate</td><td class="n">${F(r.rate,2)} per ${esc(r.unit.toLowerCase())}${r.c==='pentest'?'':' per day'}</td></tr>
+      <tr><td>Latest day</td><td class="n">${F(r.latest)} ${esc(CAPS[r.c].unitShort)} · ${F(r.perDay,2)} credits</td></tr>
+      </tbody></table>`; });
+  const share = c => { const r = m.capRows.find(x => x.c === c); return r ? r.share : 0; };
+  const ordered = [...CAP_ORDER].sort((x, y) => share(y) - share(x));
+  $('donutLegend').innerHTML = ordered.map(c => { const sh = share(c); const r = m.capRows.find(x => x.c === c);
+    return `<li class="${sh ? '' : 'zero'}"><span class="sw" style="background:${capColor(c)}"></span><span>${esc(CAPS[c].label)} <b>${F(sh*100,2)}%</b>${r ? `<br><span class="muted">${F(r.credits,2)} credits</span>` : ''}</span></li>`; }).join('');
+  $('donutNote').textContent = m.days.length ? `${fdate(m.days[0])} – ${fdate(m.days[m.days.length-1])}` : 'term to date';
+}
+function renderCaps(m){
+  const rows = m.capRows.map(r => `<tr><td><span class="dot" style="background:${capColor(r.c)}"></span>${esc(r.label)}</td><td class="n">${F(r.latest)}<div class="muted" style="font-size:11px">${esc(CAPS[r.c].unitShort)}</div></td><td class="n">${F(r.rate,2)}</td><td class="n">${F(r.perDay,2)}</td><td class="n">${F(r.unitDays)}</td><td class="n"><b>${F(r.credits,2)}</b></td><td class="n">${F(r.share*100,1)}%</td></tr>`).join('');
+  $('capTable').innerHTML = `<div class="tbl"><table><thead><tr><th>Capability</th><th class="n">Latest day</th><th class="n">Rate</th><th class="n">Credits/day</th><th class="n">Unit-days</th><th class="n">Credits</th><th class="n">Share</th></tr></thead><tbody>${rows}
+    <tr><td><b>Total</b></td><td></td><td></td><td class="n"><b>${F(m.latest,2)}</b></td><td class="n">${F(m.capRows.reduce((a,r)=>a+r.unitDays,0))}</td><td class="n"><b>${F(m.used,2)}</b></td><td class="n">100%</td></tr></tbody></table></div>`;
+}
+function renderInsights(m){
+  if (!$('insights')) return;
+  $('insights').innerHTML = m.insights.length ? m.insights.map(i => `<div class="ins ${i.sev}"><span class="stripe"></span><div><h3>${esc(i.title)}</h3><p>${esc(i.body)}</p></div></div>`).join('') : '<p class="muted">Nothing stands out in this view.</p>';
+  $('insCount').textContent = `${m.insights.length} findings`;
+}
+function spark(arr, color){ const n = arr.length; if (n < 2) return ''; const mx = Math.max(...arr, 1e-9); const w = 72, h = 20; const pts = arr.map((v,i)=>`${(i/(n-1)*w).toFixed(1)},${(h-2-v/mx*(h-4)).toFixed(1)}`).join(' ');
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`; }
+
+const TABS = {
+  groups: () => ({note:'Credits by Snyk group. Units are as Snyk attributed them to each org.', cols:[
+    {k:'group', l:'Group'}, {k:'orgs', l:'Orgs billed', n:1}, ...MODEL.caps.map(c => ({k:'cap_'+c, l:CAPS[c].label, n:1, v:r=>r.cap[c]||0, f:v=>F(v,2)})),
+    {k:'credits', l:'Credits', n:1, f:v=>F(v,2), b:1}, {k:'share', l:'Share', n:1, f:v=>F(v*100,1)+'%'}, {k:'perDay', l:'Latest credits/day', n:1, f:v=>F(v,1)},
+    {k:'trend', l:'Trend', h:r=>spark(r.daily,'var(--accent)'), nosort:1}, {k:'tests', l:'Tests', n:1, f:F}], rows:MODEL.groupRows, sort:['credits','desc']}),
+  orgs: () => ({note:'Every org with billable usage. "No tests" marks capabilities billed without a single test in the period.', cols:[
+    {k:'name', l:'Organization', h:r=>`${esc(r.name)}${r.slug && r.slug!==r.name ? `<div class="muted mono" style="font-size:11px">${esc(r.slug)}</div>`:''}`}, {k:'group', l:'Group'},
+    ...MODEL.caps.map(c => ({k:'lu_'+c, l:CAPS[c].label+' '+(CAPS[c].unitShort), n:1, v:r=>r.lu[c]||0, f:F})),
+    {k:'perDay', l:'Credits/day', n:1, f:v=>F(v,1)}, {k:'credits', l:'Credits', n:1, f:v=>F(v,2), b:1}, {k:'share', l:'Share', n:1, f:v=>F(v*100,1)+'%'},
+    {k:'trend', l:'Trend', h:r=>spark(r.daily,'var(--accent)'), nosort:1}, {k:'repos', l:'Repos', n:1, f:F}, {k:'tests', l:'Tests', n:1, f:F},
+    {k:'flags', l:'Flags', nosort:1, h:r=>r.untested.map(c=>`<span class="chip warn">No ${esc(CAPS[c].label)} tests</span>`).join('')}], rows:MODEL.orgRows, sort:['credits','desc']}),
+  repos: () => ({note:'Built from monitored-test rows: repository (or image) name, branch and target file parsed from the project name. Credits are billed per org, not per repo.', cols:[
+    {k:'repo', l:'Repository / image', w:1, h:r=>`${esc(r.repo)}${r.registry?`<div class="muted mono" style="font-size:11px">${esc(r.registry)}</div>`:''}`}, {k:'org', l:'Organization'}, {k:'group', l:'Group'},
+    {k:'kind', l:'Source'}, {k:'capsTxt', l:'Capabilities', v:r=>[...r.caps].map(c=>CAPS[c]?CAPS[c].label:c).join(', ')},
+    {k:'projects', l:'Projects', n:1, f:F}, {k:'nb', l:'Branches / tags', n:1, v:r=>r.branches.size || r.targets.size, f:F},
+    {k:'nonDefault', l:'Non-default branches', n:1, f:v=>v?`<span class="chip warn">${F(v)}</span>`:'0', raw:1},
+    {k:'tests', l:'Tests', n:1, f:F}, {k:'flowsTxt', l:'Flows', v:r=>Object.entries(r.flows).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k} ${v}`).join(' · ')},
+    {k:'last', l:'Last tested', v:r=>String(r.last).slice(0,16)}], rows:MODEL.repos, sort:['tests','desc'], limit:400}),
+  sources: () => {
+    const caps = [...new Set([...MODEL.flowCap.keys()].map(k=>k.split('|')[0]))];
+    const flows = [...new Set([...MODEL.flowCap.keys()].map(k=>k.split('|')[1]))];
+    const rows = flows.map(f => { const r = {flow:f, total:0}; caps.forEach(c => { const v = MODEL.flowCap.get(c+'|'+f)||0; r['c_'+c] = v; r.total += v; }); return r; });
+    return {note:'Where scans come from. Flow comes from the FLOW column; source is inferred from the project name format.', pre: kindsTable(), cols:[
+      {k:'flow', l:'Flow', h:r=>`<b>${esc(r.flow)}</b><div class="muted" style="font-size:11px;white-space:normal">${esc(FLOW_GLOSS[r.flow]||'')}</div>`, w:1},
+      ...caps.map(c => ({k:'c_'+c, l:(CAPS[c]?CAPS[c].label:c)+' tests', n:1, f:F})), {k:'total', l:'Total tests', n:1, f:F, b:1}], rows, sort:['total','desc']};
+  }
+};
+TABS.dups = () => ({note:'Repositories imported more than once. Copies = extra projects with the same capability, branch and file. Duplicate tests = tests beyond the most-tested copy.', cols:[
+    {k:'repo', l:'Repository / image', w:1, h:r=>`${esc(r.repo)}${r.crossGroup ? ' <span class="chip warn">cross-group</span>' : ''}`},
+    {k:'orgsTxt', l:'Organizations', w:1, v:r=>r.orgNames.join(', ')}, {k:'groupsTxt', l:'Groups', v:r=>r.groupNames.join(', ')},
+    {k:'nOrgs', l:'Orgs', n:1, v:r=>r.orgs.size, f:F}, {k:'capsTxt', l:'Capabilities', v:r=>[...r.caps].map(c=>CAPS[c]?CAPS[c].label:c).join(', ')},
+    {k:'projects', l:'Projects', n:1, f:F}, {k:'dupProjects', l:'Duplicate copies', n:1, f:F, b:1}, {k:'sameOrg', l:'Same-org copies', n:1, f:F},
+    {k:'tests', l:'Tests', n:1, f:F}, {k:'dupTests', l:'Duplicate tests', n:1, f:F, b:1}], rows:MODEL.dups.rows, sort:['dupTests','desc'], limit:400});
+const FLOW_GLOSS = {recurring:'Scheduled retest of a monitored project (daily or weekly).', 'web-test':'Test run by the Snyk platform: import, SCM-triggered or manual retest.', cli:'snyk test / monitor from the CLI or a CI pipeline.', unknown:'No flow recorded.'};
+function kindsTable(){
+  const tot = MODEL.kinds.reduce((a,k)=>a+k.tests,0)||1;
+  return `<h3 style="margin:0 0 8px">Integration source</h3><div class="tbl" style="margin-bottom:18px"><table><thead><tr><th>Source</th><th class="n">Repos / images</th><th class="n">Projects</th><th class="n">Tests</th><th class="n">Share of tests</th></tr></thead><tbody>${
+    MODEL.kinds.sort((a,b)=>b.tests-a.tests).map(k=>`<tr><td>${esc(k.kind)}</td><td class="n">${F(k.repos.size)}</td><td class="n">${F(k.projects)}</td><td class="n">${F(k.tests)}</td><td class="n">${F(k.tests/tot*100,1)}%</td></tr>`).join('')}</tbody></table></div><h3 style="margin:0 0 8px">Tests by flow</h3>`;
+}
+function cellVal(c, r){ return c.v ? c.v(r) : r[c.k]; }
+function renderTab(){
+  if (!MODEL) return;
+  document.querySelectorAll('[data-dgran]').forEach(b => b.addEventListener('click', () => { DGRAN = b.dataset.dgran; document.querySelectorAll('[data-dgran]').forEach(x => x.setAttribute('aria-checked', String(x === b))); if (MODEL) renderDaily(MODEL); }));
+  document.querySelectorAll('[data-gran]').forEach(b => b.addEventListener('click', () => { GRAN = b.dataset.gran; document.querySelectorAll('[data-gran]').forEach(x => x.setAttribute('aria-checked', String(x === b))); if (MODEL) renderCum(MODEL); }));
+  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === TAB)));
+  const def = TABS[TAB](); const q = $('search').value.trim().toLowerCase();
+  const [sk, sd] = SORT[TAB] || def.sort; const sc = def.cols.find(c=>c.k===sk) || def.cols[0];
+  let rows = def.rows;
+  if (q) rows = rows.filter(r => def.cols.some(c => !c.n && String(cellVal(c,r)??'').toLowerCase().includes(q)));
+  rows = [...rows].sort((a,b) => { const va = cellVal(sc,a), vb = cellVal(sc,b); const r = (typeof va === 'number' && typeof vb === 'number') ? va - vb : String(va).localeCompare(String(vb)); return sd === 'asc' ? r : -r; });
+  const total = rows.length; const lim = def.limit || 1e9; rows = rows.slice(0, lim);
+  $('tabNote').textContent = def.note + ` ${F(total)} rows${total > lim ? `, first ${F(lim)} shown` : ''}.`;
+  const th = def.cols.map(c => `<th class="${c.n?'n':''}" data-k="${c.k}" ${c.nosort?'':`data-dir="${c.k===sk?sd:''}"`}>${esc(c.l)}</th>`).join('');
+  const tb = rows.map(r => '<tr>' + def.cols.map(c => { const v = cellVal(c, r); const html = c.h ? c.h(r) : c.f ? (c.raw ? c.f(v) : esc(c.f(v))) : esc(v); return `<td class="${c.n?'n':''}${c.w?' tdwrap':''}">${c.b?'<b>'+html+'</b>':html}</td>`; }).join('') + '</tr>').join('');
+  $('tabBody').innerHTML = (def.pre||'') + `<div class="tbl" style="max-height:560px"><table><thead><tr>${th}</tr></thead><tbody>${tb || `<tr><td colspan="${def.cols.length}" class="muted">No rows match.</td></tr>`}</tbody></table></div>`;
+  $('tabBody').querySelectorAll('th[data-k]').forEach(h => h.addEventListener('click', () => { const c = def.cols.find(x=>x.k===h.dataset.k); if (c.nosort) return; const cur = SORT[TAB] || def.sort; SORT[TAB] = [c.k, cur[0]===c.k && cur[1]==='desc' ? 'asc' : 'desc']; renderTab(); }));
+}
+function renderRateCard(){
+  if (!$('rateCard') || $('rateCard').dataset.done) return; $('rateCard').dataset.done = 1;
+  $('rateCard').innerHTML = `<table><thead><tr><th>Capability</th><th>Unit of measure</th><th class="n">Credits / unit / day</th></tr></thead><tbody>${CAP_ORDER.map(c => `<tr><td><span class="dot" style="background:${capColor(c)}"></span>${esc(CAPS[c].label)}</td><td>per ${esc(CAPS[c].unit)}${c==='pentest'?'':' per day'}</td><td class="n"><input type="number" step="0.01" min="0" id="rate_${c}" value="${rates[c]}" aria-label="${esc(CAPS[c].label)} rate"></td></tr>`).join('')}</tbody></table>`;
+  CAP_ORDER.forEach(c => $('rate_'+c).addEventListener('change', e => { const v = parseFloat(e.target.value); rates[c] = isNaN(v) ? CAPS[c].rate : v; render(); }));
+}
+
+// ---- summary & export ----
+function summaryText(){
+  const m = MODEL; if (!m) return '';
+  const L = [];
+  L.push(`${$('fCustomer').value || 'Account'}: Snyk credit utilization as of ${fdate(dstr(m.asOf))}`);
+  L.push(`Credits used: ${F(m.used)}${m.ent ? ` of ${F(m.ent)} (${F(m.used/m.ent*100,2)}%)` : ''}; ${m.daysInto} of ${m.termDays} days into term`);
+  L.push(`Run-rate: ${F(m.rate)} credits/day (${m.W===1?'latest day':m.W+'-day avg'})${m.evenPace ? `; even pace is ${F(m.evenPace)}/day` : ''}`);
+  if (m.score != null) L.push(`Utilization score: ${F(m.score,1)}% projected at term end (${m.band.t}); Snyk in-app projection ${F(m.projLinear/m.ent*100,3)}%`);
+  L.push(`Projected at term end: ${F(m.projRun)} credits` + (m.overage>0 ? `; overage ${F(m.overage)} from ${m.exhaust}` : m.ent ? `; unused ${F(m.unused)}` : ''));
+  L.push('', 'By capability:'); m.capRows.forEach(r => L.push(`- ${r.label}: ${F(r.credits,2)} credits (${F(r.share*100,1)}%), ${F(r.latest)} ${CAPS[r.c].unitShort} on the latest day`));
+  L.push('', 'By group:'); [...m.groupRows].sort((a,b)=>b.credits-a.credits).forEach(g => L.push(`- ${g.group}: ${F(g.credits,2)} credits, ${g.orgs} orgs`));
+  L.push('', 'Findings:'); m.insights.forEach(i => L.push(`- ${i.title}. ${i.body}`));
+  return L.join('\n');
+}
+async function copySummary(){ const t = summaryText(); if (!t) return; try { await navigator.clipboard.writeText(t); toast('Summary copied'); } catch(e) {
+  const ta = document.createElement('textarea'); ta.value = t; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); toast('Summary copied'); } catch(_) { toast('Copy is blocked here. Select the text manually.'); } ta.remove(); } }
+async function exportXlsx(){
+  const m = MODEL; if (!m || !downloads) return;
+  const wb = XLSX.utils.book_new(); const add = (name, rows) => XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), name);
+  add('Summary', [['Metric','Value'], ['Customer', $('fCustomer').value], ['As of', dstr(m.asOf)], ['Term', `${$('fStart').value} to ${$('fEnd').value}`], ['Credits purchased', m.ent], ['Credits used', +m.used.toFixed(2)],
+    ['Days into term', m.daysInto], ['Days left', m.daysLeft], ['Run-rate basis (days)', m.W], ['Run-rate credits/day', +m.rate.toFixed(2)], ['Latest day credits', +m.latest.toFixed(2)],
+    ['Projected at term end (run-rate)', +m.projRun.toFixed(0)], ['Projected (Snyk linear)', m.projLinear!=null ? +m.projLinear.toFixed(0) : ''], ['Utilization score %', m.score!=null ? +m.score.toFixed(2) : ''],
+    ['Status', m.band ? m.band.t : ''], ['Unused at term end', +m.unused.toFixed(0)], ['Overage', +m.overage.toFixed(0)], ['Credits run out', m.exhaust||''], ['Price per credit', m.price||''],
+    ...(m.extra ? [['Trend vs 7-day average %', m.extra.trend != null ? +m.extra.trend.toFixed(1) : ''], ['Week vs plan %', m.extra.week ? +m.extra.week.pct.toFixed(1) : ''], ['Peak day', m.extra.peak.d], ['Peak day credits', +m.extra.peak.v.toFixed(2)], ['Savings from cleanup (credits/day)', +m.extra.saved.toFixed(1)]] : []),
+    [], ['Findings'], ...m.insights.map(i => [i.title, i.body])]);
+  add('Capabilities', [['Capability','Unit','Rate','Latest day units','Unit-days','Credits','Share %'], ...m.capRows.map(r => [r.label, r.unit, r.rate, r.latest, r.unitDays, +r.credits.toFixed(2), +(r.share*100).toFixed(2)])]);
+  add('Daily', [['Date', ...m.caps.map(c => CAPS[c].label+' units'), ...m.caps.map(c => CAPS[c].label+' credits'), 'Total credits'], ...m.days.map((d,i) => [d, ...m.caps.map(c => m.units[c][i]), ...m.caps.map(c => +(m.units[c][i]*rates[c]).toFixed(2)), +m.dailyCredits[i].toFixed(2)])]);
+  add('Groups', [['Group','Orgs billed', ...m.caps.map(c=>CAPS[c].label+' credits'), 'Credits','Share %','Latest credits/day','Tests'], ...m.groupRows.map(g => [g.group, g.orgs, ...m.caps.map(c => +(g.cap[c]||0).toFixed(2)), +g.credits.toFixed(2), +(g.share*100).toFixed(2), +g.perDay.toFixed(2), g.tests])]);
+  add('Organizations', [['Organization','Slug','Group', ...m.caps.map(c=>CAPS[c].label+' latest '+CAPS[c].unitShort), ...m.caps.map(c=>CAPS[c].label+' credits'), 'Credits','Share %','Latest credits/day','Repos','Tests','Billed without tests'],
+    ...m.orgRows.sort((a,b)=>b.credits-a.credits).map(o => [o.name, o.slug, o.group, ...m.caps.map(c => o.lu[c]||0), ...m.caps.map(c => +(o.cap[c]||0).toFixed(2)), +o.credits.toFixed(2), +(o.share*100).toFixed(2), +o.perDay.toFixed(2), o.repos, o.tests, o.untested.map(c=>CAPS[c].label).join(', ')])]);
+  add('Repositories', [['Repository / image','Registry','Organization','Group','Source','Capabilities','Projects','Branches','Non-default branches','Tests','Flows','Last tested'],
+    ...m.repos.sort((a,b)=>b.tests-a.tests).map(r => [r.repo, r.registry, r.org, r.group, r.kind, [...r.caps].map(c=>CAPS[c]?CAPS[c].label:c).join(', '), r.projects, [...r.branches].join(', '), r.nonDefault, r.tests, Object.entries(r.flows).map(([k,v])=>`${k} ${v}`).join(', '), String(r.last).slice(0,19)])]);
+  add('Projects', [['Project','Repository / image','Branch','Target','Source','Capability','Organization','Group','Tests','Last tested','URL'],
+    ...m.projects.map(p => [p.name, p.repo, p.branch, p.target, p.kind, CAPS[p.cap]?CAPS[p.cap].label:p.cap, (ST.orgs.get(p.org)||{}).name||p.org, p.group, p.n, String(p.last).slice(0,19), p.url])]);
+  add('Duplicate scans', [['Repository / image','Organizations','Groups','Orgs','Capabilities','Projects','Duplicate copies','Same-org copies','Tests','Duplicate tests'],
+    ...m.dups.rows.sort((a,b)=>b.dupTests-a.dupTests).map(r => [r.repo, r.orgNames.join(', '), r.groupNames.join(', '), r.orgs.size, [...r.caps].map(c=>CAPS[c]?CAPS[c].label:c).join(', '), r.projects, r.dupProjects, r.sameOrg, r.tests, r.dupTests])]);
+  const data = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+  const name = `credit-utilization-${($('fCustomer').value||'account').replace(/[^\w-]+/g,'-').toLowerCase()}-${dstr(m.asOf)}.xlsx`;
+  const blob = new Blob([data], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  try { await downloads.save({filename:name, data:blob}); toast('Workbook ready'); }
+  catch (e) { const code = (e && (e.code || e.name) || '').toString().toLowerCase();
+    if (/declin|cancel|abort|denied|not_granted/.test(code)) { toast('Export cancelled'); return; }
+    try { await downloads.save({filename:name, data:new Uint8Array(data)}); toast('Workbook ready'); } catch (e2) { toast('Export did not complete: ' + ((e2 && e2.message) || 'unknown error')); } }
+}
+
+// ---- wire up ----
+function applyTheme(t){
+  const root = document.documentElement;
+  if (t === 'light' || t === 'dark') root.setAttribute('data-theme', t); else root.removeAttribute('data-theme');
+  document.querySelectorAll('[data-theme-opt]').forEach(b => b.setAttribute('aria-checked', String(b.dataset.themeOpt === (t || 'system'))));
+  if (ST) render();
+}
+(function initTheme(){
+  let t = 'system'; try { t = localStorage.getItem(LS + '-theme') || 'system'; } catch(e){}
+  applyTheme(t);
+  document.querySelectorAll('[data-theme-opt]').forEach(b => b.addEventListener('click', () => {
+    const v = b.dataset.themeOpt; try { localStorage.setItem(LS + '-theme', v); } catch(e){} applyTheme(v);
+  }));
+})();
+(function init(){
+  const s = loadSettings();
+  if (s && s.basis) $('fBasis').value = s.basis;
+  ['fBasis','fGroup','fCap'].forEach(id => $(id).addEventListener('change', () => { saveSettings(); render(); }));
+  $('file').addEventListener('change', e => { if (e.target.files.length) setPending([...e.target.files]); e.target.value = ''; });
+  $('btnLoad').addEventListener('click', () => openModal('new'));
+  $('btnDupAll').addEventListener('click', () => { TAB = 'dups'; $('search').value = ''; renderTab(); document.querySelector('.tabs').scrollIntoView({behavior:'smooth', block:'start'}); });
+  $('btnEdit').addEventListener('click', () => openModal(ST && ST.sample ? 'new' : 'edit'));
+  $('btnBuild').addEventListener('click', onBuild);
+  $('mCancel').addEventListener('click', () => closeModal(true));
+  $('mClose').addEventListener('click', () => closeModal(true));
+  $('modal').addEventListener('click', e => { if (e.target === $('modal')) closeModal(true); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('modal').hidden) closeModal(true); });
+  MFIELDS.forEach(id => $(id).addEventListener('input', () => { $(id).classList.remove('invalid'); const er = $('err_'+id); if (er) er.textContent = ''; }));
+  const dz = $('drop');
+  dz.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } });
+  ['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('over'); }));
+  dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) setPending([...e.dataTransfer.files]); });
+  $('btnSample').addEventListener('click', () => { loadSample(); });
+  $('btnCopy').addEventListener('click', copySummary);
+  $('btnExport').addEventListener('click', exportXlsx);
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => { TAB = t.dataset.tab; $('search').value = ''; renderTab(); }));
+  $('search').addEventListener('input', () => { clearTimeout(init.t); init.t = setTimeout(renderTab, 150); });
+  loadSample();
+  const hook = () => { if (window.claude && window.claude.use) { window.claude.use('downloads').then(d => { downloads = d; $('btnExport').hidden = !d; }).catch(() => {}); return true; } return false; };
+  if (!hook()) setTimeout(hook, 1500);
+})();
+</script>
+
+</body></html>
