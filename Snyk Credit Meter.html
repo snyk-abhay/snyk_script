@@ -185,6 +185,11 @@ tbody tr:hover td{background:color-mix(in srgb, var(--accent-soft) 55%, transpar
 .orgctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 .orgctl select{border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:5px 8px}
 .seg-ctl button[disabled]{opacity:.4;cursor:not-allowed}
+.otbl th[data-sort]{cursor:pointer}
+.otbl th[data-sort]:hover{color:var(--ink)}
+.otbl th[data-sort]::after{content:" ↕";font-size:9px;opacity:.35}
+.otbl th[data-dir="asc"]::after{content:" ▲";opacity:1}
+.otbl th[data-dir="desc"]::after{content:" ▼";opacity:1}
 .chip.t-up{color:var(--crit);background:var(--crit-soft);border-color:transparent}
 .chip.t-down{color:var(--good);background:var(--good-soft);border-color:transparent}
 .chip.t-new{color:var(--info);background:var(--info-soft);border-color:transparent}
@@ -321,7 +326,7 @@ code{font-family:var(--f-mono);font-size:12px;background:var(--sunk);padding:1px
     <div class="chart-head"><h2>Organization usage</h2>
       <div class="orgctl">
         <div class="seg-ctl" role="radiogroup" aria-label="Comparison window"><button type="button" role="radio" data-owin="7" aria-checked="false">7 days</button><button type="button" role="radio" data-owin="14" aria-checked="true">14 days</button><button type="button" role="radio" data-owin="30" aria-checked="false">30 days</button></div>
-        <select id="orgSort" aria-label="Sort organizations"><option value="recent">Sort: highest recent usage</option><option value="rise">Sort: biggest increase</option><option value="fall">Sort: biggest decrease</option><option value="total">Sort: total credits to date</option></select>
+        <select id="orgSort" aria-label="Sort organizations"><option value="recent">Sort: highest recent usage</option><option value="rise">Sort: biggest increase</option><option value="fall">Sort: biggest decrease</option><option value="total">Sort: total credits to date</option><option value="custom">Sort: by column header</option></select>
       </div>
     </div>
     <p class="burn-note" id="orgHighlights"></p>
@@ -1157,7 +1162,19 @@ function renderDonut(m){
   $('donutNote').textContent = m.days.length ? `${fdate(m.days[0])} – ${fdate(m.days[m.days.length-1])}` : 'term to date';
 }
 // ---- organization usage trend: who is driving usage, who is rising, who is falling ----
-let OWIN = 14, OSORT = 'recent';
+let OWIN = 14, OSORT = 'recent', OKEY = 'rec', ODIR = 'desc';
+const SORTS = {recent:['rec','desc'], rise:['delta','desc'], fall:['delta','asc'], total:['total','desc']};
+const TEXT_KEYS = ['name','group','trend'];
+function orgSortVal(r, key, T){
+  if (/^day\d+$/.test(key)) return r.o.daily[T.n - T.K + +key.slice(3)] || 0;
+  return {name:r.o.name, group:r.o.group, trend:r.st, rec:r.rec, pri:r.pri, delta:r.delta, pct:r.pct, share:r.share, total:r.o.credits}[key];
+}
+function orgSortLabel(m, T){
+  const lab = {name:'Organization', group:'Group', trend:'Trend', rec:`Last ${T.W}d avg/day`, pri:`Prev ${T.W}d avg/day`, delta:'Change/day', pct:'Change %', share:'Share', total:'Total credits'};
+  let name = lab[OKEY]; if (!name && /^day\d+$/.test(OKEY)) name = fdate(m.days[T.n - T.K + +OKEY.slice(3)]);
+  const how = TEXT_KEYS.includes(OKEY) ? (ODIR === 'asc' ? 'A → Z' : 'Z → A') : (ODIR === 'asc' ? 'low to high' : 'high to low');
+  return `Sorted by ${name || OKEY}: ${how}`;
+}
 const sumRange = (a, s, e) => { let t = 0; for (let i = Math.max(0, s); i < e; i++) t += a[i] || 0; return t; };
 const trunc = (s, k) => { s = String(s); return s.length > k ? s.slice(0, k - 1) + '…' : s; };
 function orgTrend(m){
@@ -1174,7 +1191,17 @@ function orgTrend(m){
   rows.forEach(r => r.share = totRec ? r.rec / totRec : 0);
   return {n, W, K, rows, totRec, totPri};
 }
-function orgSorted(rows){
+function orgSorted(rows, T){
+  const dir = ODIR === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const x = orgSortVal(a, OKEY, T), y = orgSortVal(b, OKEY, T);
+    if (x == null && y == null) return a.o.name.localeCompare(b.o.name);
+    if (x == null) return 1; if (y == null) return -1;
+    const c = typeof x === 'string' ? x.localeCompare(y, undefined, {sensitivity:'base', numeric:true}) : x - y;
+    return c * dir || a.o.name.localeCompare(b.o.name);
+  });
+}
+function orgSortedOld(rows){
   const f = {recent:(a,b)=>b.rec-a.rec, rise:(a,b)=>b.delta-a.delta, fall:(a,b)=>a.delta-b.delta, total:(a,b)=>b.o.credits-a.o.credits}[OSORT] || ((a,b)=>b.rec-a.rec);
   return [...rows].sort(f);
 }
@@ -1192,8 +1219,9 @@ function renderOrgTrend(m){
   const nd = m.days.length;
   document.querySelectorAll('[data-owin]').forEach(b => { const N = +b.dataset.owin, ok = 2 * N <= nd; b.disabled = !ok; b.title = ok ? '' : `Needs ${2 * N} days of data; this view has ${nd}`; b.setAttribute('aria-checked', String(!!T && T.W === N)); });
   if (!T) { $('orgHighlights').innerHTML = ''; $('orgBars').innerHTML = '<p class="muted">Not enough days of billable data in this view to compare organizations.</p>'; $('orgStack').innerHTML = ''; $('orgStackLegend').innerHTML = ''; $('orgTable').innerHTML = ''; return; }
-  const sorted = orgSorted(T.rows);
-  $('orgSortNote').textContent = {recent:'Sorted by highest recent usage', rise:'Sorted by biggest increase', fall:'Sorted by biggest decrease', total:'Sorted by total credits'}[OSORT] || '';
+  const sorted = orgSorted(T.rows, T);
+  $('orgSortNote').textContent = orgSortLabel(m, T);
+  { const hit = Object.keys(SORTS).find(k => SORTS[k][0] === OKEY && SORTS[k][1] === ODIR); $('orgSort').value = hit || 'custom'; }
   $('orgBarsTitle').textContent = `Average credits/day: last ${T.W} days vs the ${T.W} before`;
   $('orgLegPrev').textContent = `Previous ${T.W} days`; $('orgLegRec').textContent = `Last ${T.W} days`;
   renderOrgHighlights(T); renderOrgBars(T, sorted); renderOrgStack(m, T); renderOrgTable(m, T, sorted);
@@ -1250,7 +1278,8 @@ function renderOrgStack(m, T){
 }
 function renderOrgTable(m, T, sorted){
   const n = T.n, K = T.K, start = n - K;
-  const dayHdr = m.days.slice(start).map(d => `<th class="n hm" title="${esc(fdate(d))}">${fdShort(dnum(d))}</th>`).join('');
+  const th = (key, label, cls = '') => { const on = OKEY === key; return `<th class="${cls}" data-sort="${key}" tabindex="0" aria-sort="${on ? (ODIR === 'asc' ? 'ascending' : 'descending') : 'none'}"${on ? ` data-dir="${ODIR}"` : ''}>${label}</th>`; };
+  const dayHdr = m.days.slice(start).map((d, i) => th('day' + i, fdShort(dnum(d)), 'n hm')).join('');
   const chipCls = {Increasing:'t-up', Decreasing:'t-down', New:'t-new', Stopped:'t-stop'};
   const body = sorted.map(r => {
     const a = r.o.daily.slice(start), mx = Math.max(...a, 1e-9), p = pctText(r);
@@ -1262,7 +1291,7 @@ function renderOrgTable(m, T, sorted){
   }).join('');
   const totCells = Array.from({length:K}, (_, i) => `<td class="n hm">${F(T.rows.reduce((acc, r) => acc + (r.o.daily[start + i] || 0), 0), 1)}</td>`).join('');
   const dChange = T.totRec - T.totPri;
-  $('orgTable').innerHTML = `<table><thead><tr><th class="stk">Organization</th><th>Group</th><th>Trend</th><th class="n">Last ${T.W}d avg/day</th><th class="n">Prev ${T.W}d avg/day</th><th class="n">Change/day</th><th class="n">Change %</th><th class="n">Share</th><th class="n">Total credits</th><th>Last ${K} days</th>${dayHdr}</tr></thead><tbody>${body}`
+  $('orgTable').innerHTML = `<table><thead><tr>${th('name','Organization','stk')}${th('group','Group')}${th('trend','Trend')}${th('rec',`Last ${T.W}d avg/day`,'n')}${th('pri',`Prev ${T.W}d avg/day`,'n')}${th('delta','Change/day','n')}${th('pct','Change %','n')}${th('share','Share','n')}${th('total','Total credits','n')}<th>Last ${K} days</th>${dayHdr}</tr></thead><tbody>${body}`
     + `<tr class="tot"><td class="stk">All organizations</td><td></td><td></td><td class="n">${F(T.totRec,1)}</td><td class="n">${F(T.totPri,1)}</td><td class="n">${dChange>0?'+':dChange<0?'−':''}${F(Math.abs(dChange),1)}</td><td class="n">${T.totPri ? (dChange>=0?'+':'−') + F(Math.abs(dChange/T.totPri*100), 1) + '%' : '–'}</td><td class="n">100%</td><td class="n">${F(m.used,1)}</td><td></td>${totCells}</tr></tbody></table>`;
 }
 function renderCaps(m){
@@ -1423,7 +1452,15 @@ function applyTheme(t){
   $('btnSample').addEventListener('click', () => { loadSample(); });
   $('btnCopy').addEventListener('click', copySummary);
   document.querySelectorAll('[data-owin]').forEach(b => b.addEventListener('click', () => { OWIN = +b.dataset.owin; document.querySelectorAll('[data-owin]').forEach(x => x.setAttribute('aria-checked', String(x === b))); if (MODEL) renderOrgTrend(MODEL); }));
-  ['change','input'].forEach(ev => $('orgSort').addEventListener(ev, e => { OSORT = e.target.value; if (MODEL) renderOrgTrend(MODEL); }));
+  ['change','input'].forEach(ev => $('orgSort').addEventListener(ev, e => { const v = e.target.value; if (!SORTS[v]) return; OSORT = v; [OKEY, ODIR] = SORTS[v]; if (MODEL) renderOrgTrend(MODEL); }));
+  const onSortHdr = e => {
+    const h = e.target.closest && e.target.closest('th[data-sort]'); if (!h || !MODEL) return;
+    if (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ') return; e.preventDefault();
+    const k = h.dataset.sort; if (OKEY === k) ODIR = ODIR === 'asc' ? 'desc' : 'asc'; else { OKEY = k; ODIR = TEXT_KEYS.includes(k) ? 'asc' : 'desc'; }
+    renderOrgTrend(MODEL);
+    if (e.type === 'keydown') { const t = $('orgTable').querySelector(`th[data-sort="${k}"]`); if (t) t.focus(); }
+  };
+  $('orgTable').addEventListener('click', onSortHdr); $('orgTable').addEventListener('keydown', onSortHdr);
   $('btnExport').addEventListener('click', exportXlsx);
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => { TAB = t.dataset.tab; $('search').value = ''; renderTab(); }));
   $('search').addEventListener('input', () => { clearTimeout(init.t); init.t = setTimeout(renderTab, 150); });
