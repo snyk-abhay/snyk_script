@@ -181,6 +181,23 @@ tbody tr:hover td{background:color-mix(in srgb, var(--accent-soft) 55%, transpar
 .chip{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;background:var(--sunk);color:var(--muted);margin-right:4px;border:1px solid var(--line)}
 .chip.warn{color:var(--warn);background:var(--warn-soft);border-color:transparent}
 .spark{display:inline-block;vertical-align:middle}
+/* org usage trend */
+.orgctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.orgctl select{border:1px solid var(--line);background:var(--surface);border-radius:7px;padding:5px 8px}
+.seg-ctl button[disabled]{opacity:.4;cursor:not-allowed}
+.chip.t-up{color:var(--crit);background:var(--crit-soft);border-color:transparent}
+.chip.t-down{color:var(--good);background:var(--good-soft);border-color:transparent}
+.chip.t-new{color:var(--info);background:var(--info-soft);border-color:transparent}
+.chip.t-stop{color:var(--warn);background:var(--warn-soft);border-color:transparent}
+.otbl{max-height:560px;overflow:auto}
+.otbl th{cursor:default;top:0}
+.otbl th.stk,.otbl td.stk{position:sticky;left:0;z-index:2;background:var(--surface);border-right:1px solid var(--line)}
+.otbl th.stk{background:var(--sunk);z-index:3}
+.otbl tbody tr:hover td.stk{background:var(--accent-soft)}
+.otbl td.hm{min-width:46px;padding:8px 6px}
+.otbl th.hm{min-width:46px;padding:8px 6px}
+.otbl tr.tot td{font-weight:600;background:var(--sunk);border-top:1px solid var(--line)}
+.otbl tr.tot td.stk{background:var(--sunk)}
 /* insights */
 .insights{display:flex;flex-direction:column;gap:10px}
 .ins{display:grid;grid-template-columns:4px minmax(0,1fr);gap:12px;padding:10px 12px 10px 0;border-bottom:1px solid var(--line)}
@@ -298,6 +315,23 @@ code{font-family:var(--f-mono);font-size:12px;background:var(--sunk);padding:1px
       <div class="chart-head"><h2>Cumulative usage by capability</h2><span class="muted" style="font-size:12px" id="donutNote">term to date</span></div>
       <div class="donut-wrap"><div id="donutChart"></div><ul class="donut-legend" id="donutLegend"></ul></div>
     </div>
+  </section>
+
+  <section class="panel" id="orgTrendPanel" aria-label="Organization usage">
+    <div class="chart-head"><h2>Organization usage</h2>
+      <div class="orgctl">
+        <div class="seg-ctl" role="radiogroup" aria-label="Comparison window"><button type="button" role="radio" data-owin="7" aria-checked="false">7 days</button><button type="button" role="radio" data-owin="14" aria-checked="true">14 days</button><button type="button" role="radio" data-owin="30" aria-checked="false">30 days</button></div>
+        <select id="orgSort" aria-label="Sort organizations"><option value="recent">Sort: highest recent usage</option><option value="rise">Sort: biggest increase</option><option value="fall">Sort: biggest decrease</option><option value="total">Sort: total credits to date</option></select>
+      </div>
+    </div>
+    <p class="burn-note" id="orgHighlights"></p>
+    <div class="grid2">
+      <div class="chart"><h3 id="orgBarsTitle" style="margin-bottom:6px">Average credits/day by organization</h3><div id="orgBars"></div>
+        <div class="legendrow" style="margin-top:8px"><span><i style="background:var(--muted);opacity:.45"></i><span id="orgLegPrev">Previous window</span></span><span><i style="background:var(--accent)"></i><span id="orgLegRec">Recent window</span></span><span><b class="bad">▲</b> using more · <b class="ok">▼</b> using less</span></div></div>
+      <div class="chart"><h3 style="margin-bottom:6px">Daily credits by organization</h3><div id="orgStack"></div><div class="legendrow" id="orgStackLegend" style="margin-top:8px"></div></div>
+    </div>
+    <h3 style="margin:18px 0 8px">Daily usage history by organization <span id="orgSortNote" class="chip t-new" style="margin:0 6px"></span><span class="muted" style="font-weight:400;font-size:12px">(credits per day, shaded by each org’s own peak)</span></h3>
+    <div class="tbl otbl" id="orgTable"></div>
   </section>
 
   <section class="panel">
@@ -780,7 +814,7 @@ function render(){
   $('filterNote').textContent = 'Filtered view. Projections compare this slice with the whole account\'s purchased credits.'; $('filterNote').hidden = !(f.group || f.cap);
   $('ctxText').innerHTML = `<b>${esc($('fCustomer').value || 'Unnamed account')}</b>${m.ent ? `<span>${F(m.ent)} credits</span>` : '<span>Credits not set</span>'}${s.start && s.end ? `<span>${fdate(s.start)} – ${fdate(s.end)}</span>` : ''}${m.asOf != null ? `<span>as of ${fdate(dstr(m.asOf))}</span>` : ''}<span>${esc(ST.files.join(', '))}</span>`;
   $('btnEdit').textContent = ST.sample ? 'Use my data' : 'Edit contract';
-  renderMeter(m); renderKpis(m); renderKpis2(m); renderCum(m); renderDaily(m); renderDup(m); renderDonut(m); renderCaps(m); renderInsights(m); renderTab(); renderRateCard();
+  renderMeter(m); renderKpis(m); renderKpis2(m); renderCum(m); renderDaily(m); renderDup(m); renderDonut(m); renderOrgTrend(m); renderCaps(m); renderInsights(m); renderTab(); renderRateCard();
   $('footInfo').textContent = `${F(ST.rows)} events · ${F(ST.billArr.reduce((a,x)=>a+x.n,0))} billable unit-days · ${F(ST.tests.size)} projects tested`;
   $('btnExport').hidden = !downloads;
 }
@@ -1122,6 +1156,115 @@ function renderDonut(m){
     return `<li class="${sh ? '' : 'zero'}"><span class="sw" style="background:${capColor(c)}"></span><span>${esc(CAPS[c].label)} <b>${F(sh*100,2)}%</b>${r ? `<br><span class="muted">${F(r.credits,2)} credits</span>` : ''}</span></li>`; }).join('');
   $('donutNote').textContent = m.days.length ? `${fdate(m.days[0])} – ${fdate(m.days[m.days.length-1])}` : 'term to date';
 }
+// ---- organization usage trend: who is driving usage, who is rising, who is falling ----
+let OWIN = 14, OSORT = 'recent';
+const sumRange = (a, s, e) => { let t = 0; for (let i = Math.max(0, s); i < e; i++) t += a[i] || 0; return t; };
+const trunc = (s, k) => { s = String(s); return s.length > k ? s.slice(0, k - 1) + '…' : s; };
+function orgTrend(m){
+  const n = m.days.length; if (n < 2 || !m.orgRows.length) return null;
+  const fit = [7, 14, 30].filter(N => N <= OWIN && 2 * N <= n); const W = fit.length ? fit[fit.length - 1] : Math.max(1, Math.floor(n / 2)), K = Math.min(n, 2 * W, 30);
+  const rows = m.orgRows.map(o => {
+    const rec = sumRange(o.daily, n - W, n) / W, pri = sumRange(o.daily, n - 2 * W, n - W) / W, delta = rec - pri;
+    const pct = pri > 0 ? delta / pri * 100 : null;
+    let st = 'Steady';
+    if (rec === 0 && pri === 0) st = 'Idle'; else if (pri === 0) st = 'New'; else if (rec === 0) st = 'Stopped'; else if (pct >= 10) st = 'Increasing'; else if (pct <= -10) st = 'Decreasing';
+    return {o, rec, pri, delta, pct, st};
+  });
+  const totRec = rows.reduce((a, r) => a + r.rec, 0), totPri = rows.reduce((a, r) => a + r.pri, 0);
+  rows.forEach(r => r.share = totRec ? r.rec / totRec : 0);
+  return {n, W, K, rows, totRec, totPri};
+}
+function orgSorted(rows){
+  const f = {recent:(a,b)=>b.rec-a.rec, rise:(a,b)=>b.delta-a.delta, fall:(a,b)=>a.delta-b.delta, total:(a,b)=>b.o.credits-a.o.credits}[OSORT] || ((a,b)=>b.rec-a.rec);
+  return [...rows].sort(f);
+}
+function pctText(r){
+  if (r.st === 'New') return {t:'New', c:'warnc'};
+  if (r.st === 'Stopped') return {t:'▼ stopped', c:'ok'};
+  if (r.st === 'Idle' || r.pct == null) return {t:'idle', c:'muted'};
+  const a = F(Math.abs(r.pct), Math.abs(r.pct) < 10 ? 1 : 0);
+  if (r.st === 'Increasing') return {t:`▲ +${a}%`, c:'bad'};
+  if (r.st === 'Decreasing') return {t:`▼ −${a}%`, c:'ok'};
+  return {t:`${r.pct >= 0 ? '+' : '−'}${a}%`, c:'muted'};
+}
+function renderOrgTrend(m){
+  const T = orgTrend(m);
+  const nd = m.days.length;
+  document.querySelectorAll('[data-owin]').forEach(b => { const N = +b.dataset.owin, ok = 2 * N <= nd; b.disabled = !ok; b.title = ok ? '' : `Needs ${2 * N} days of data; this view has ${nd}`; b.setAttribute('aria-checked', String(!!T && T.W === N)); });
+  if (!T) { $('orgHighlights').innerHTML = ''; $('orgBars').innerHTML = '<p class="muted">Not enough days of billable data in this view to compare organizations.</p>'; $('orgStack').innerHTML = ''; $('orgStackLegend').innerHTML = ''; $('orgTable').innerHTML = ''; return; }
+  const sorted = orgSorted(T.rows);
+  $('orgSortNote').textContent = {recent:'Sorted by highest recent usage', rise:'Sorted by biggest increase', fall:'Sorted by biggest decrease', total:'Sorted by total credits'}[OSORT] || '';
+  $('orgBarsTitle').textContent = `Average credits/day: last ${T.W} days vs the ${T.W} before`;
+  $('orgLegPrev').textContent = `Previous ${T.W} days`; $('orgLegRec').textContent = `Last ${T.W} days`;
+  renderOrgHighlights(T); renderOrgBars(T, sorted); renderOrgStack(m, T); renderOrgTable(m, T, sorted);
+}
+function renderOrgHighlights(T){
+  const R = T.rows; const top = [...R].sort((a,b)=>b.rec-a.rec)[0];
+  const up = R.filter(r => r.delta > 0).sort((a,b)=>b.delta-a.delta), down = R.filter(r => r.delta < 0).sort((a,b)=>a.delta-b.delta);
+  const cnt = s => R.filter(r => r.st === s).length;
+  let h = `Highest usage: <b>${esc(top.o.name)}</b>, ${F(top.rec,1)} credits/day (${F(top.share*100)}% of the last ${T.W} days).`;
+  if (up[0]) h += ` Rising fastest: <b>${esc(up[0].o.name)}</b> <span class="bad">+${F(up[0].delta,1)}/day</span> (${pctText(up[0]).t}).`;
+  if (down[0]) h += ` Falling fastest: <b>${esc(down[0].o.name)}</b> <span class="ok">−${F(Math.abs(down[0].delta),1)}/day</span> (${pctText(down[0]).t}).`;
+  h += ` ${cnt('Increasing') + cnt('New')} orgs rising, ${cnt('Decreasing') + cnt('Stopped')} falling, ${cnt('Steady')} steady. Account total ${F(T.totRec,1)}/day vs ${F(T.totPri,1)}/day before.`;
+  $('orgHighlights').innerHTML = h;
+}
+function renderOrgBars(T, sorted){
+  const list = sorted.slice(0, 12); const el = $('orgBars');
+  const W = 560, Lw = 138, BW = 300, PX = 492, RH = 32, Tp = 22, H = Tp + list.length * RH + 6;
+  const mx = Math.max(...list.map(r => Math.max(r.rec, r.pri)), 1e-9); const [ymax, step] = nice(mx * 1.05); const x = v => Lw + v / ymax * BW;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Average credits per day by organization, recent window versus previous window">`;
+  for (let v = 0; v <= ymax + 1e-9; v += step) s += `<line class="gl" x1="${x(v).toFixed(1)}" x2="${x(v).toFixed(1)}" y1="${Tp-6}" y2="${H-4}"/><text x="${x(v).toFixed(1)}" y="${Tp-10}" text-anchor="middle">${FK(v)}</text>`;
+  list.forEach((r, i) => { const y0 = Tp + i * RH, p = pctText(r), end = Math.max(r.rec, r.pri);
+    s += `<g><title>${esc(r.o.name)}: ${F(r.rec,2)} credits/day now, ${F(r.pri,2)} before (${esc(p.t)})</title>`
+      + `<text x="${Lw-8}" y="${y0+RH/2+3}" text-anchor="end">${esc(trunc(r.o.name, 20))}</text>`
+      + `<rect x="${Lw}" y="${y0+4}" width="${Math.max(1, x(r.pri)-Lw).toFixed(1)}" height="9" rx="2" fill="var(--muted)" opacity=".45"/>`
+      + `<rect x="${Lw}" y="${y0+15}" width="${Math.max(1, x(r.rec)-Lw).toFixed(1)}" height="11" rx="2" fill="var(--accent)"/>`
+      + `<text class="val" x="${(x(end)+6).toFixed(1)}" y="${y0+RH/2+3}">${F(r.rec,1)}</text>`
+      + `<text class="pct ${p.c}" x="${PX}" y="${y0+RH/2+3}">${esc(p.t)}</text></g>`; });
+  el.innerHTML = s + '</svg>';
+}
+function renderOrgStack(m, T){
+  const el = $('orgStack'), n = T.n, K = T.K, start = n - K;
+  const ranked = T.rows.map(r => ({r, v: sumRange(r.o.daily, start, n)})).sort((a,b)=>b.v-a.v);
+  const top = ranked.slice(0, 8).filter(x => x.v > 0);
+  const PAL = ['--c-opensource','--c-code','--c-container','--c-aispm','--c-secrets','--c-apiweb','--c-iac','--c-pentest'];
+  const series = top.map((x, i) => ({name:x.r.o.name, color:`var(${PAL[i]})`, vals:x.r.o.daily.slice(start)}));
+  const rest = ranked.slice(top.length).filter(x => x.v > 0);
+  if (rest.length) series.push({name:`Other (${rest.length} orgs)`, color:'var(--c-agent)', vals:Array.from({length:K}, (_, i) => rest.reduce((a, x) => a + (x.r.o.daily[start + i] || 0), 0))});
+  if (!series.length) { el.innerHTML = '<p class="muted">No usage in this period.</p>'; $('orgStackLegend').innerHTML = ''; return; }
+  const totals = Array.from({length:K}, (_, i) => series.reduce((a, s) => a + s.vals[i], 0));
+  const W = 560, H = 270, L = 46, R = 8, Tp = 14, Bt = 26, iw = W - L - R, ih = H - Tp - Bt;
+  const [ymax, step] = nice(Math.max(...totals) * 1.06); const y = v => Tp + ih - v / ymax * ih;
+  const bw = iw / K, w = Math.max(1, bw * 0.74); const every = Math.ceil(K / 7);
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily credits by organization, last ${K} days">`;
+  for (let v = 0; v <= ymax + 1e-9; v += step) s += `<line class="gl" x1="${L}" x2="${W-R}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/><text x="${L-6}" y="${(y(v)+3.5).toFixed(1)}" text-anchor="end">${FK(v)}</text>`;
+  for (let i = 0; i < K; i++) {
+    const cx = L + i * bw + bw / 2, x0 = cx - w / 2; let acc = 0; const dt = m.days[start + i];
+    series.forEach(sr => { const v = sr.vals[i]; if (v > 0) { s += `<rect x="${x0.toFixed(1)}" y="${y(acc+v).toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(0, y(acc) - y(acc+v)).toFixed(1)}" fill="${sr.color}"/>`; acc += v; } });
+    if (i % every === 0 && (i + every <= K - 1 || i === K - 1)) s += `<text x="${cx.toFixed(1)}" y="${H-8}" text-anchor="middle">${fdShort(dnum(dt))}</text>`;
+    const tip = series.map(sr => [sr.name, sr.vals[i]]).filter(a => a[1] > 0).sort((a,b)=>b[1]-a[1]).slice(0, 6).map(a => `${a[0]}: ${F(a[1],1)}`).join('\n');
+    s += `<rect x="${(L + i*bw).toFixed(1)}" y="${Tp}" width="${bw.toFixed(1)}" height="${ih}" fill="transparent"><title>${esc(fdate(dt))}: ${F(totals[i],1)} credits\n${esc(tip)}</title></rect>`;
+  }
+  el.innerHTML = s + '</svg>';
+  $('orgStackLegend').innerHTML = series.map(sr => `<span><i style="background:${sr.color}"></i>${esc(trunc(sr.name, 28))}</span>`).join('');
+}
+function renderOrgTable(m, T, sorted){
+  const n = T.n, K = T.K, start = n - K;
+  const dayHdr = m.days.slice(start).map(d => `<th class="n hm" title="${esc(fdate(d))}">${fdShort(dnum(d))}</th>`).join('');
+  const chipCls = {Increasing:'t-up', Decreasing:'t-down', New:'t-new', Stopped:'t-stop'};
+  const body = sorted.map(r => {
+    const a = r.o.daily.slice(start), mx = Math.max(...a, 1e-9), p = pctText(r);
+    const cells = a.map(v => v > 0 ? `<td class="n hm" style="background:color-mix(in srgb, var(--accent) ${Math.round(v / mx * 38)}%, transparent)">${F(v,1)}</td>` : `<td class="n hm muted">·</td>`).join('');
+    const sc = r.st === 'Increasing' || r.st === 'New' ? 'var(--crit)' : r.st === 'Decreasing' || r.st === 'Stopped' ? 'var(--good)' : 'var(--accent)';
+    return `<tr><td class="stk"><b>${esc(r.o.name)}</b></td><td>${esc(r.o.group)}</td><td><span class="chip ${chipCls[r.st]||''}">${r.st}</span></td>`
+      + `<td class="n"><b>${F(r.rec,1)}</b></td><td class="n">${F(r.pri,1)}</td><td class="n ${r.delta>0?'bad':r.delta<0?'ok':''}">${r.delta>0?'+':r.delta<0?'−':''}${F(Math.abs(r.delta),1)}</td>`
+      + `<td class="n"><span class="${p.c}">${esc(p.t)}</span></td><td class="n">${F(r.share*100,1)}%</td><td class="n">${F(r.o.credits,1)}</td><td>${spark(a, sc)}</td>${cells}</tr>`;
+  }).join('');
+  const totCells = Array.from({length:K}, (_, i) => `<td class="n hm">${F(T.rows.reduce((acc, r) => acc + (r.o.daily[start + i] || 0), 0), 1)}</td>`).join('');
+  const dChange = T.totRec - T.totPri;
+  $('orgTable').innerHTML = `<table><thead><tr><th class="stk">Organization</th><th>Group</th><th>Trend</th><th class="n">Last ${T.W}d avg/day</th><th class="n">Prev ${T.W}d avg/day</th><th class="n">Change/day</th><th class="n">Change %</th><th class="n">Share</th><th class="n">Total credits</th><th>Last ${K} days</th>${dayHdr}</tr></thead><tbody>${body}`
+    + `<tr class="tot"><td class="stk">All organizations</td><td></td><td></td><td class="n">${F(T.totRec,1)}</td><td class="n">${F(T.totPri,1)}</td><td class="n">${dChange>0?'+':dChange<0?'−':''}${F(Math.abs(dChange),1)}</td><td class="n">${T.totPri ? (dChange>=0?'+':'−') + F(Math.abs(dChange/T.totPri*100), 1) + '%' : '–'}</td><td class="n">100%</td><td class="n">${F(m.used,1)}</td><td></td>${totCells}</tr></tbody></table>`;
+}
 function renderCaps(m){
   const rows = m.capRows.map(r => `<tr><td><span class="dot" style="background:${capColor(r.c)}"></span>${esc(r.label)}</td><td class="n">${F(r.latest)}<div class="muted" style="font-size:11px">${esc(CAPS[r.c].unitShort)}</div></td><td class="n">${F(r.rate,2)}</td><td class="n">${F(r.perDay,2)}</td><td class="n">${F(r.unitDays)}</td><td class="n"><b>${F(r.credits,2)}</b></td><td class="n">${F(r.share*100,1)}%</td></tr>`).join('');
   $('capTable').innerHTML = `<div class="tbl"><table><thead><tr><th>Capability</th><th class="n">Latest day</th><th class="n">Rate</th><th class="n">Credits/day</th><th class="n">Unit-days</th><th class="n">Credits</th><th class="n">Share</th></tr></thead><tbody>${rows}
@@ -1228,6 +1371,7 @@ async function exportXlsx(){
   add('Groups', [['Group','Orgs billed', ...m.caps.map(c=>CAPS[c].label+' credits'), 'Credits','Share %','Latest credits/day','Tests'], ...m.groupRows.map(g => [g.group, g.orgs, ...m.caps.map(c => +(g.cap[c]||0).toFixed(2)), +g.credits.toFixed(2), +(g.share*100).toFixed(2), +g.perDay.toFixed(2), g.tests])]);
   add('Organizations', [['Organization','Slug','Group', ...m.caps.map(c=>CAPS[c].label+' latest '+CAPS[c].unitShort), ...m.caps.map(c=>CAPS[c].label+' credits'), 'Credits','Share %','Latest credits/day','Repos','Tests','Billed without tests'],
     ...m.orgRows.sort((a,b)=>b.credits-a.credits).map(o => [o.name, o.slug, o.group, ...m.caps.map(c => o.lu[c]||0), ...m.caps.map(c => +(o.cap[c]||0).toFixed(2)), +o.credits.toFixed(2), +(o.share*100).toFixed(2), +o.perDay.toFixed(2), o.repos, o.tests, o.untested.map(c=>CAPS[c].label).join(', ')])]);
+  add('Org daily', [['Organization','Group','Total credits', ...m.days], ...[...m.orgRows].sort((a,b) => b.credits - a.credits).map(o => [o.name, o.group, +o.credits.toFixed(2), ...o.daily.map(v => +v.toFixed(2))])]);
   add('Repositories', [['Repository / image','Registry','Organization','Group','Source','Capabilities','Projects','Branches','Non-default branches','Tests','Flows','Last tested'],
     ...m.repos.sort((a,b)=>b.tests-a.tests).map(r => [r.repo, r.registry, r.org, r.group, r.kind, [...r.caps].map(c=>CAPS[c]?CAPS[c].label:c).join(', '), r.projects, [...r.branches].join(', '), r.nonDefault, r.tests, Object.entries(r.flows).map(([k,v])=>`${k} ${v}`).join(', '), String(r.last).slice(0,19)])]);
   add('Projects', [['Project','Repository / image','Branch','Target','Source','Capability','Organization','Group','Tests','Last tested','URL'],
@@ -1278,6 +1422,8 @@ function applyTheme(t){
   dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) setPending([...e.dataTransfer.files]); });
   $('btnSample').addEventListener('click', () => { loadSample(); });
   $('btnCopy').addEventListener('click', copySummary);
+  document.querySelectorAll('[data-owin]').forEach(b => b.addEventListener('click', () => { OWIN = +b.dataset.owin; document.querySelectorAll('[data-owin]').forEach(x => x.setAttribute('aria-checked', String(x === b))); if (MODEL) renderOrgTrend(MODEL); }));
+  ['change','input'].forEach(ev => $('orgSort').addEventListener(ev, e => { OSORT = e.target.value; if (MODEL) renderOrgTrend(MODEL); }));
   $('btnExport').addEventListener('click', exportXlsx);
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => { TAB = t.dataset.tab; $('search').value = ''; renderTab(); }));
   $('search').addEventListener('input', () => { clearTimeout(init.t); init.t = setTimeout(renderTab, 150); });
