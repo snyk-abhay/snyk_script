@@ -9,8 +9,10 @@ WHAT THE TOGGLE IS
     "Enable Dockerfile detection"
 
     It is per SCM integration, so one org can have it on for GitHub and off for
-    GitLab. The script visits every SCM integration page of each chosen org and
-    sets the toggle wherever the "Detect Dockerfiles" card exists. Orgs with no
+    GitLab. The script visits every integration page of each chosen org
+    (GitHub, GitHub Enterprise, GitHub Cloud App, GitLab, Bitbucket, Azure
+    Repos, ...) and sets the toggle wherever the "Detect Dockerfiles" card
+    exists. CLI and container-registry integrations are skipped. Orgs with no
     SCM integration are reported as "no-scm" and left alone.
 
     The setting is NOT exposed by the integration-settings API (checked: the
@@ -28,6 +30,9 @@ INTERACTIVE (no flags)
     2. Asks: enable or disable?
     3. Lists your orgs; you choose all, some (numbers / names), or one group.
     4. Opens the browser and flips the toggle org by org, verifying each one.
+    5. Writes dockerfile_report_<apply|dryrun>_<timestamp>.csv in the current
+       directory: one row per org and integration with previous_status and
+       new_status (on / off), whether it changed, and the outcome.
 
 WITH FLAGS (for scripting)
 
@@ -64,6 +69,7 @@ NOTES
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -79,11 +85,21 @@ SESSION_FILE = "snyk_session.json"
 PROGRESS_FILE = "progress_dockerfile.json"
 DEFAULT_ORGS_FILE = "orgs_dockerfile.txt"
 
-# SCM integrations as named by /api/v1/org/{id}/integrations; the same name is
-# the page path under /org/{slug}/manage/integrations/. Registry integrations
-# (ecr, acr, docker-hub...) have no Dockerfile card and are not visited.
-SCM_TYPES = ["github", "github-enterprise", "gitlab", "bitbucket-cloud",
-             "bitbucket-server", "bitbucket-connect-app", "azure-repos"]
+# Integration names come from /api/v1/org/{id}/integrations; the same name is
+# the page path under /org/{slug}/manage/integrations/. Snyk keeps adding SCM
+# flavours (github, github-enterprise, github-cloud-app, gitlab, bitbucket-*,
+# azure-repos ...), so instead of listing the SCMs we visit every integration
+# the org has except these, which can never carry a Dockerfile card.
+NON_SCM_TYPES = {"cli", "ecr", "acr", "gcr", "docker-hub", "artifactory-cr",
+                 "quay-cr", "nexus-cr", "harbor-cr", "digitalocean-cr",
+                 "github-cr", "gitlab-cr", "google-artifact-cr", "kubernetes",
+                 "heroku", "aws-lambda", "azure-functions", "cloudformation",
+                 "terraform-cloud", "jenkins", "circleci", "travis", "bamboo",
+                 "teamcity", "gradle", "maven", "sbt", "npm", "pip"}
+
+
+def is_scm_candidate(itype):
+    return itype not in NON_SCM_TYPES and not itype.endswith("-cr")
 INTEGRATION_PAGE = "{app}/org/{slug}/manage/integrations/{itype}"
 CARD_HEADING = "Detect Dockerfiles"
 TOGGLE_LABEL = "Enable Dockerfile detection"
@@ -199,60 +215,133 @@ def list_integrations(api, org_id):
     return list(data) if resp.status == 200 and isinstance(data, dict) else None
 
 
-def set_integration_toggle(page, slug, itype, target, apply_changes):
-    """One integration page. Returns (status, detail):
-    no-card | already | would-set | set | not-saved"""
-    page.goto(INTEGRATION_PAGE.format(app=APP_BASE, slug=slug, itype=itype),
-              wait_until="domcontentloaded", timeout=60000)
-    if "/login" in page.url or "okta.com" in page.url:
-        raise SessionExpired()
+def open_integration_page(ctx, url, attempts=3):
+    """Open `url` in a FRESH tab and return it once it has rendered (some
+    heading is on it), or None. Two things the app does that this guards:
+      * Reusing one tab, later pages often come back as an empty shell; a fresh
+        tab per page loads reliably.
+      * Without the render check, "page did not load" looks exactly like "page
+        has no Dockerfile card" and the integration is silently skipped.
+    Raises SessionExpired on a login redirect."""
+    for _ in range(attempts):
+        page = ctx.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            if "/login" in page.url or "okta.com" in page.url:
+                raise SessionExpired()
+            page.get_by_role("heading").first.wait_for(timeout=20000)
+            return page
+        except SessionExpired:
+            page.close()
+            raise
+        except Exception:
+            page.close()
+    return None
 
-    def card():
-        return page.locator(".settings-section-card",
-                            has=page.get_by_role("heading", name=CARD_HEADING))
 
+def set_integration_toggle(ctx, slug, itype, target, apply_changes):
+    """One integration page. Returns (status, detail, before, after) where
+    status is no-card | not-loaded | already | would-set | set | not-saved,
+    and before/after are 'on' / 'off' / '' (after is only what was verified
+    after reloading, so it is blank in a dry run)."""
+    url = INTEGRATION_PAGE.format(app=APP_BASE, slug=slug, itype=itype)
+    page = open_integration_page(ctx, url)
+    if page is None:
+        return "not-loaded", "page never rendered after 3 tries", "", ""
     try:
-        card().first.wait_for(timeout=10000)
+        return _toggle_on_page(ctx, page, url, target, apply_changes)
+    finally:
+        for pg in list(ctx.pages):
+            pg.close()
+
+
+def _card(page):
+    return page.locator(".settings-section-card",
+                        has=page.get_by_role("heading", name=CARD_HEADING))
+
+
+def _word(on):
+    return "on" if on else "off"
+
+
+def _toggle_on_page(ctx, page, url, target, apply_changes):
+    try:
+        _card(page).first.wait_for(timeout=10000)
     except Exception:
-        return "no-card", ""
-    box = card().first.get_by_role("checkbox")
-    current = box.is_checked()
+        # The page rendered, so this integration really has no such setting.
+        return "no-card", "", "", ""
+    current = _card(page).first.get_by_role("checkbox").is_checked()
+    before = _word(current)
     if current is target:
-        return "already", "on" if current else "off"
+        return "already", before, before, before
     if not apply_changes:
-        return "would-set", f"{'on' if current else 'off'} -> {'on' if target else 'off'}"
+        return "would-set", f"{before} -> {_word(target)}", before, ""
 
     # The input is styled away; the label is what a person clicks. No Save
     # button on this card -- it saves on change.
-    card().first.get_by_text(TOGGLE_LABEL).click()
+    _card(page).first.get_by_text(TOGGLE_LABEL).click()
     page.wait_for_timeout(2000)
-    page.reload(wait_until="domcontentloaded", timeout=60000)
-    card().first.wait_for(timeout=10000)
-    if card().first.get_by_role("checkbox").is_checked() is target:
-        return "set", f"{'on' if current else 'off'} -> {'on' if target else 'off'}"
-    return "not-saved", "toggle reverted after reload (not Org Admin?)"
+    page.close()
+    page = open_integration_page(ctx, url)
+    if page is None:
+        return "not-saved", "clicked, but the page would not reload to verify", before, ""
+    try:
+        _card(page).first.wait_for(timeout=10000)
+    except Exception:
+        return "not-saved", "clicked, but the card was missing on reload", before, ""
+    after = _word(_card(page).first.get_by_role("checkbox").is_checked())
+    if after == _word(target):
+        return "set", f"{before} -> {after}", before, after
+    return "not-saved", "toggle reverted after reload (not Org Admin?)", before, after
 
 
-def process_org(ctx, page, slug, org_id, target, apply_changes):
-    """Returns (status, detail). status is 'ok' or a failure label."""
+def process_org(ctx, slug, org_id, target, apply_changes):
+    """Returns (status, detail, rows). status is 'ok' or a failure label;
+    rows is one dict per integration for the CSV report."""
+    def row(integration, status, detail="", before="", after=""):
+        return {"integration": integration, "previous_status": before,
+                "new_status": after, "status": status, "detail": detail}
+
     types = list_integrations(ctx.request, org_id)
     if types is None:
-        return "no-access", "could not list integrations (not a member / session)"
-    scm = [t for t in types if t in SCM_TYPES]
+        msg = "could not list integrations (not a member / session)"
+        return "no-access", msg, [row("", "no-access", msg)]
+    scm = [t for t in types if is_scm_candidate(t)]
     if not scm:
-        return "no-scm", "no SCM integration -- left alone"
+        msg = "no SCM integration -- left alone"
+        return "no-scm", msg, [row("", "no-scm", msg)]
 
-    parts, failed = [], False
+    parts, rows, failed, found = [], [], False, False
     for itype in scm:
-        status, detail = set_integration_toggle(page, slug, itype, target,
-                                                apply_changes)
-        if status == "no-card":
-            continue
+        status, detail, before, after = set_integration_toggle(
+            ctx, slug, itype, target, apply_changes)
+        # Every integration is listed, so nothing is skipped silently.
         parts.append(f"{itype}: {status}" + (f" ({detail})" if detail else ""))
-        failed = failed or status == "not-saved"
-    if not parts:
-        return "no-card", "SCM page has no Dockerfile card -- left alone"
-    return ("not-saved" if failed else "ok"), "; ".join(parts)
+        rows.append(row(itype, status, detail, before, after))
+        found = found or status != "no-card"
+        failed = failed or status in ("not-saved", "not-loaded")
+    if failed:
+        return "incomplete", "; ".join(parts), rows
+    if not found:
+        return "no-card", "; ".join(parts) + " -- left alone", rows
+    return "ok", "; ".join(parts), rows
+
+
+REPORT_COLUMNS = ["timestamp", "org_slug", "org_id", "org_status", "integration",
+                  "target", "mode", "previous_status", "new_status", "changed",
+                  "status", "detail"]
+
+
+def write_report(report, apply_changes):
+    """CSV of every org/integration touched. Returns the path (cwd)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(os.getcwd(), "dockerfile_report_"
+                        f"{'apply' if apply_changes else 'dryrun'}_{stamp}.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=REPORT_COLUMNS)
+        w.writeheader()
+        w.writerows(report)
+    return path
 
 
 def run_orgs(orgs, apply_changes, enable, delay, insecure, headless, checkpoint):
@@ -271,17 +360,17 @@ def run_orgs(orgs, apply_changes, enable, delay, insecure, headless, checkpoint)
           f"{'APPLY' if apply_changes else 'DRY RUN (read-only)'}"
           f"{' | INSECURE TLS' if insecure else ''}\n")
 
-    results = {}
+    results, report = {}, []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         ctx = browser.new_context(storage_state=SESSION_FILE,
                                   ignore_https_errors=insecure)
-        page = ctx.new_page()
         try:
             for i, (slug, org_id) in enumerate(todo, 1):
+                rows = []
                 try:
-                    status, detail = process_org(ctx, page, slug, org_id,
-                                                 target, apply_changes)
+                    status, detail, rows = process_org(ctx, slug, org_id,
+                                                       target, apply_changes)
                 except SessionExpired:
                     browser.close()
                     sys.exit("\nSession expired -- you were sent to the login page. "
@@ -292,7 +381,18 @@ def run_orgs(orgs, apply_changes, enable, delay, insecure, headless, checkpoint)
                         browser.close()
                         sys.exit(TLS_HINT)
                     status, detail = f"error:{type(e).__name__}", msg[:80]
+                    rows = [{"integration": "", "previous_status": "",
+                             "new_status": "", "status": status,
+                             "detail": msg[:200]}]
                 results[slug] = status
+                now = time.strftime("%Y-%m-%d %H:%M:%S")
+                for r in rows:
+                    report.append({"timestamp": now, "org_slug": slug,
+                                   "org_id": org_id, "org_status": status,
+                                   "target": _word(target),
+                                   "mode": "apply" if apply_changes else "dry-run",
+                                   "changed": "yes" if r["status"] == "set" else "no",
+                                   **r})
                 if checkpoint:
                     prog[slug] = status
                     with open(PROGRESS_FILE, "w") as f:
@@ -302,6 +402,10 @@ def run_orgs(orgs, apply_changes, enable, delay, insecure, headless, checkpoint)
                     time.sleep(delay)
         finally:
             browser.close()
+            # Written even if the run stopped early (expired session, Ctrl+C),
+            # so what was done up to that point is on record.
+            if report:
+                print(f"\nreport -> {write_report(report, apply_changes)}")
 
     counts = {}
     for v in results.values():
@@ -310,8 +414,10 @@ def run_orgs(orgs, apply_changes, enable, delay, insecure, headless, checkpoint)
     if "no-scm" in counts or "no-card" in counts:
         print("no-scm / no-card = nothing to toggle there (no SCM integration, or its "
               "page has no Dockerfile card). Not an error.")
-    if "not-saved" in counts:
-        print("not-saved = the click did not stick -- usually not Org Admin there.")
+    if "incomplete" in counts:
+        print("incomplete = at least one integration page did not load or the click "
+              "did not stick (see the not-loaded / not-saved lines above; not-saved "
+              "is usually not Org Admin). Re-run to retry just those orgs.")
     if not apply_changes:
         print("\nDry run only -- nothing was changed. Add --apply to write.")
 
